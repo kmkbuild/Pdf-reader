@@ -1,0 +1,20 @@
+{
+  "appId": "com.pdfreader.bookapp",
+  "appName": "PDF Book Reader",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#0b0b0b"
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 2000,
+      "backgroundColor": "#0b0b0b",
+      "showSpinner": false,
+      "splashFullScreen": true,
+      "splashImmersive": true
+    }
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
