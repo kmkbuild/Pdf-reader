@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── PDF.js ──────────────────────────────────────────────────────────────────
+// ── PDF.js ───────────────────────────────────────────────────────────────────
 const PV = "3.11.174";
 const PDFJS_URL = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/pdf.min.js`;
 const WORKER_URL = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/pdf.worker.min.js`;
@@ -14,78 +14,66 @@ function loadScript(src) {
   });
 }
 
-// ── IndexedDB persistence ────────────────────────────────────────────────────
-const DB_NAME = "PDFReaderDB";
-const DB_VERSION = 1;
-
+// ── IndexedDB ────────────────────────────────────────────────────────────────
+const DB_NAME = "PDFReaderDB", DB_VER = 1;
 function openDB() {
   return new Promise((res, rej) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = e => {
+    const r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = e => {
       const db = e.target.result;
-      // Store PDF files as ArrayBuffer
       if (!db.objectStoreNames.contains("pdfs"))
         db.createObjectStore("pdfs", { keyPath: "name" });
-      // Store app settings (bookmarks, notes, lastRead)
       if (!db.objectStoreNames.contains("settings"))
         db.createObjectStore("settings", { keyPath: "key" });
     };
-    req.onsuccess = e => res(e.target.result);
-    req.onerror = e => rej(e.target.error);
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = e => rej(e.target.error);
   });
 }
-
-async function dbSavePDF(name, arrayBuffer, size, modified) {
+async function dbSavePDF(name, buf, size, modified) {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction("pdfs", "readwrite");
-    tx.objectStore("pdfs").put({ name, data: arrayBuffer, size, modified });
-    tx.oncomplete = () => res();
-    tx.onerror = e => rej(e.target.error);
+    tx.objectStore("pdfs").put({ name, data: buf, size, modified });
+    tx.oncomplete = res; tx.onerror = e => rej(e.target.error);
   });
 }
-
 async function dbGetAllPDFs() {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction("pdfs", "readonly");
-    const req = tx.objectStore("pdfs").getAll();
-    req.onsuccess = e => res(e.target.result || []);
-    req.onerror = e => rej(e.target.error);
+    const r = tx.objectStore("pdfs").getAll();
+    r.onsuccess = e => res(e.target.result || []);
+    r.onerror = e => rej(e.target.error);
   });
 }
-
 async function dbDeletePDF(name) {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction("pdfs", "readwrite");
     tx.objectStore("pdfs").delete(name);
-    tx.oncomplete = () => res();
-    tx.onerror = e => rej(e.target.error);
+    tx.oncomplete = res; tx.onerror = e => rej(e.target.error);
   });
 }
-
 async function dbSaveSetting(key, value) {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction("settings", "readwrite");
     tx.objectStore("settings").put({ key, value });
-    tx.oncomplete = () => res();
-    tx.onerror = e => rej(e.target.error);
+    tx.oncomplete = res; tx.onerror = e => rej(e.target.error);
   });
 }
-
 async function dbGetSetting(key) {
   const db = await openDB();
   return new Promise((res, rej) => {
     const tx = db.transaction("settings", "readonly");
-    const req = tx.objectStore("settings").get(key);
-    req.onsuccess = e => res(e.target.result?.value ?? null);
-    req.onerror = e => rej(e.target.error);
+    const r = tx.objectStore("settings").get(key);
+    r.onsuccess = e => res(e.target.result?.value ?? null);
+    r.onerror = e => rej(e.target.error);
   });
 }
 
-// ── Cover color per book ─────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 function coverColor(name) {
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0xffffffff;
@@ -94,7 +82,6 @@ function coverColor(name) {
   return { bg: `hsl(${hue},50%,42%)`, spine: `hsl(${hue},50%,28%)`, text: `hsl(${hue},15%,92%)` };
 }
 
-// ── Scan folder recursively ──────────────────────────────────────────────────
 async function scanDir(dirHandle, depth = 0) {
   const pdfs = [];
   if (depth > 5) return pdfs;
@@ -111,22 +98,25 @@ async function scanDir(dirHandle, depth = 0) {
 
 // ════════════════════════════════════════════════════════════════════════════
 export default function PDFReader() {
-  // ── App state ──
   const [screen, setScreen] = useState("library");
   const [pdfjsReady, setPdfjsReady] = useState(false);
-  const [dark, setDark] = useState(false); // LIGHT default
+  const [dark, setDark] = useState(false);
 
-  // ── Library ──
+  // Library
   const [library, setLibrary] = useState([]);
+  const [recentBooks, setRecentBooks] = useState([]); // names of recently opened
   const [scanning, setScanning] = useState(false);
-  const [libSearch, setLibSearch] = useState("");
   const [toast, setToast] = useState(null);
+  const [storagePermission, setStoragePermission] = useState("ask"); // "ask"|"granted"|"denied"|"skip"
+  const [showPermPopup, setShowPermPopup] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
-  // ── Reader ──
+  // Reader
   const [pdfDoc, setPdfDoc] = useState(null);
   const [numPages, setNumPages] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [zoom, setZoom] = useState(1);
+  const [baseZoom, setBaseZoom] = useState(1);
   const [rendering, setRendering] = useState(false);
   const [currentBook, setCurrentBook] = useState(null);
   const [toc, setToc] = useState([]);
@@ -138,120 +128,155 @@ export default function PDFReader() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
-
-  // ── Panel state (all closed by default) ──
-  const [activePanel, setActivePanel] = useState(null); // null | "saved" | "goto" | "search" | "notes" | "toc"
+  const [activePanel, setActivePanel] = useState(null);
   const [goInput, setGoInput] = useState("");
+  const [readerDrawerOpen, setReaderDrawerOpen] = useState(false);
+  const [allBookmarksView, setAllBookmarksView] = useState(false);
 
   const canvasRef = useRef(null);
   const renderTaskRef = useRef(null);
   const fileInputRef = useRef(null);
   const containerRef = useRef(null);
+  const pinchRef = useRef({ active: false, startDist: 0, startZoom: 1 });
 
-  // ── Load PDF.js + restore saved library & settings ──
+  // ── Boot ──────────────────────────────────────────────────────────────────
   useEffect(() => {
-    // Load PDF.js engine
     loadScript(PDFJS_URL).then(() => {
       window.pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_URL;
       setPdfjsReady(true);
     });
-    // Restore all PDFs saved in IndexedDB
     dbGetAllPDFs().then(rows => {
       if (!rows.length) return;
-      const books = rows.map(row => ({
-        name: row.name,
-        file: new File([row.data], row.name + ".pdf", { type: "application/pdf" }),
-        size: row.size,
-        modified: row.modified,
-      }));
-      setLibrary(books);
+      setLibrary(rows.map(r => ({
+        name: r.name,
+        file: new File([r.data], r.name + ".pdf", { type: "application/pdf" }),
+        size: r.size, modified: r.modified,
+      })));
     }).catch(() => {});
-    // Restore settings
     dbGetSetting("bookmarks").then(v => { if (v) setBookmarks(v); }).catch(() => {});
     dbGetSetting("notes").then(v => { if (v) setNotes(v); }).catch(() => {});
     dbGetSetting("lastRead").then(v => { if (v) setLastRead(v); }).catch(() => {});
     dbGetSetting("dark").then(v => { if (v !== null) setDark(v); }).catch(() => {});
+    dbGetSetting("recentBooks").then(v => { if (v) setRecentBooks(v); }).catch(() => {});
+    dbGetSetting("storagePermission").then(v => {
+      if (v) { setStoragePermission(v); }
+      else { setTimeout(() => setShowPermPopup(true), 800); }
+    }).catch(() => { setTimeout(() => setShowPermPopup(true), 800); });
   }, []);
 
+  // Android hardware back button
   useEffect(() => {
-    if (currentBook) setNoteInput(notes[currentBook.name]?.[currentPage] || "");
-  }, [currentPage, currentBook]);
+    const handleBack = (e) => {
+      if (screen === "reader") {
+        e.preventDefault();
+        setScreen("library");
+        setPdfDoc(null);
+        setActivePanel(null);
+        setReaderDrawerOpen(false);
+      }
+    };
+    window.addEventListener("popstate", handleBack);
+    // Push a state so back button triggers popstate
+    window.history.pushState({ page: "app" }, "");
+    return () => window.removeEventListener("popstate", handleBack);
+  }, [screen]);
 
-  // ── Auto-save settings to IndexedDB whenever they change ──
+  // Auto-save settings
   useEffect(() => { dbSaveSetting("bookmarks", bookmarks).catch(() => {}); }, [bookmarks]);
   useEffect(() => { dbSaveSetting("notes", notes).catch(() => {}); }, [notes]);
   useEffect(() => { dbSaveSetting("lastRead", lastRead).catch(() => {}); }, [lastRead]);
   useEffect(() => { dbSaveSetting("dark", dark).catch(() => {}); }, [dark]);
+  useEffect(() => { dbSaveSetting("recentBooks", recentBooks).catch(() => {}); }, [recentBooks]);
+
+  useEffect(() => {
+    if (currentBook) setNoteInput(notes[currentBook.name]?.[currentPage] || "");
+  }, [currentPage, currentBook]);
 
   const showToast = (msg, type = "info") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 2500);
   };
 
-  // ── Auto-fit zoom to container width ──
-  const calcZoom = useCallback((page) => {
-    const container = containerRef.current;
-    if (!container) return 1.2;
-    const availW = container.clientWidth - 32;
-    const vp = page.getViewport({ scale: 1 });
-    return Math.max(0.5, availW / vp.width);
-  }, []);
-
-  // ── Render page ──
-  const renderPage = useCallback(async (doc, pageNum, customZoom) => {
-    if (!canvasRef.current || !doc) return;
-    if (renderTaskRef.current) {
-      try { renderTaskRef.current.cancel(); } catch {}
+  // ── Storage permission popup handler ──────────────────────────────────────
+  const handleGrantPermission = async () => {
+    if (!("showDirectoryPicker" in window)) {
+      setShowPermPopup(false);
+      setStoragePermission("skip");
+      dbSaveSetting("storagePermission", "skip").catch(() => {});
+      fileInputRef.current.click();
+      return;
     }
-    setRendering(true);
     try {
-      const page = await doc.getPage(pageNum);
-      const scale = customZoom || calcZoom(page);
-      const vp = page.getViewport({ scale });
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext("2d");
-      canvas.width = vp.width;
-      canvas.height = vp.height;
-      // Clear canvas first
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      // White background so colour PDFs render correctly
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      const task = page.render({
-        canvasContext: ctx,
-        viewport: vp,
-        intent: "display",
-      });
-      renderTaskRef.current = task;
-      await task.promise;
+      const dir = await window.showDirectoryPicker({ mode: "read" });
+      setShowPermPopup(false);
+      setStoragePermission("granted");
+      dbSaveSetting("storagePermission", "granted").catch(() => {});
+      setScanning(true);
+      const found = await scanDir(dir);
+      setScanning(false);
+      if (found.length) {
+        for (const book of found) {
+          try {
+            const buf = await book.file.arrayBuffer();
+            await dbSavePDF(book.name, buf, book.size, book.modified);
+          } catch {}
+        }
+        setLibrary(prev => {
+          const names = new Set(prev.map(b => b.name));
+          return [...prev, ...found.filter(b => !names.has(b.name))];
+        });
+        showToast(`Found ${found.length} PDFs and saved to library!`, "success");
+      } else {
+        showToast("No PDFs found, but permission granted.");
+      }
     } catch (e) {
-      if (e?.name !== "RenderingCancelledException") console.error("Render error:", e);
-    } finally {
-      setRendering(false);
+      setScanning(false);
+      if (e?.name !== "AbortError") showToast("Could not access storage.");
+      setShowPermPopup(false);
     }
-  }, [calcZoom]);
-
-  useEffect(() => {
-    if (pdfDoc) renderPage(pdfDoc, currentPage, zoom !== 1 ? zoom : null);
-  }, [pdfDoc, currentPage, zoom, renderPage]);
-
-  // ── Flatten TOC outline ──
-  const flattenOutline = (items, depth = 0) => {
-    if (!items) return [];
-    return items.flatMap(item => [
-      { title: item.title, dest: item.dest, depth },
-      ...flattenOutline(item.items, depth + 1),
-    ]);
   };
 
-  // ── Open a book ──
+  const handleDontAskAgain = () => {
+    setShowPermPopup(false);
+    setStoragePermission("skip");
+    dbSaveSetting("storagePermission", "skip").catch(() => {});
+  };
+
+  // ── Add PDFs ──────────────────────────────────────────────────────────────
+  const handleFiles = async (files) => {
+    if (!files?.length) return;
+    const newBooks = Array.from(files)
+      .filter(f => f.name.toLowerCase().endsWith(".pdf"))
+      .map(f => ({ name: f.name.replace(/\.pdf$/i, ""), file: f, size: f.size, modified: f.lastModified }));
+    if (!newBooks.length) { showToast("No PDF files selected."); return; }
+    for (const book of newBooks) {
+      try {
+        const buf = await book.file.arrayBuffer();
+        await dbSavePDF(book.name, buf, book.size, book.modified);
+      } catch {}
+    }
+    setLibrary(prev => {
+      const names = new Set(prev.map(b => b.name));
+      return [...prev, ...newBooks.filter(b => !names.has(b.name))];
+    });
+    showToast(`${newBooks.length} PDF${newBooks.length > 1 ? "s" : ""} added to library!`, "success");
+  };
+
+  // ── Open book ─────────────────────────────────────────────────────────────
   const openBook = async (book) => {
-    if (!pdfjsReady) { showToast("Still loading PDF engine…"); return; }
+    if (!pdfjsReady) { showToast("PDF engine loading, please wait…"); return; }
     setCurrentBook(book);
     const resumePage = lastRead[book.name] || 1;
-    setCurrentPage(resumePage);
     setToc([]); setSearchResults([]); setSearchQuery("");
-    setTextCache({}); setActivePanel(null); setZoom(1);
+    setTextCache({}); setActivePanel(null); setReaderDrawerOpen(false);
+    setAllBookmarksView(false);
+
+    // Update recents
+    setRecentBooks(prev => {
+      const filtered = prev.filter(n => n !== book.name);
+      return [book.name, ...filtered].slice(0, 6);
+    });
+
     try {
       const buf = await book.file.arrayBuffer();
       const loadingTask = window.pdfjsLib.getDocument({
@@ -263,70 +288,113 @@ export default function PDFReader() {
       const doc = await loadingTask.promise;
       setPdfDoc(doc);
       setNumPages(doc.numPages);
-      try {
-        const outline = await doc.getOutline();
-        setToc(flattenOutline(outline));
-      } catch { setToc([]); }
+      setCurrentPage(resumePage);
+      try { setToc(flattenOutline(await doc.getOutline())); } catch { setToc([]); }
       setScreen("reader");
     } catch (e) {
-      console.error("PDF open error:", e);
-      showToast("Could not open PDF. File may be corrupted.", "error");
+      console.error(e);
+      showToast("Could not open this PDF. It may be corrupted.", "error");
     }
   };
 
-  // ── File upload handlers ──
-  const handleFiles = async (files) => {
-    if (!files?.length) return;
-    const newBooks = Array.from(files)
-      .filter(f => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"))
-      .map(f => ({ name: f.name.replace(/\.pdf$/i, ""), file: f, size: f.size, modified: f.lastModified }));
-    if (!newBooks.length) { showToast("No PDF files found."); return; }
-
-    // Save each PDF's bytes into IndexedDB so it persists after app closes
-    for (const book of newBooks) {
-      try {
-        const buf = await book.file.arrayBuffer();
-        await dbSavePDF(book.name, buf, book.size, book.modified);
-      } catch (e) { console.warn("Could not save to DB:", e); }
-    }
-
-    setLibrary(prev => {
-      const names = new Set(prev.map(b => b.name));
-      const added = newBooks.filter(b => !names.has(b.name));
-      return [...prev, ...added];
-    });
-    showToast(`Added ${newBooks.length} book${newBooks.length > 1 ? "s" : ""}! It will stay in your library.`, "success");
+  const flattenOutline = (items, depth = 0) => {
+    if (!items) return [];
+    return items.flatMap(i => [
+      { title: i.title, dest: i.dest, depth },
+      ...flattenOutline(i.items, depth + 1),
+    ]);
   };
 
-  const handleScanFolder = async () => {
-    if (!("showDirectoryPicker" in window)) {
-      fileInputRef.current.click(); return;
+  // ── Render page (fix blur with devicePixelRatio) ──────────────────────────
+  const renderPage = useCallback(async (doc, pageNum, scaleOverride) => {
+    if (!canvasRef.current || !doc) return;
+    if (renderTaskRef.current) {
+      try { renderTaskRef.current.cancel(); } catch {}
     }
+    setRendering(true);
     try {
-      const dir = await window.showDirectoryPicker({ mode: "read" });
-      setScanning(true);
-      const found = await scanDir(dir);
-      setScanning(false);
-      if (!found.length) { showToast("No PDFs found in that folder."); return; }
-      // Save all found PDFs to IndexedDB
-      for (const book of found) {
-        try {
-          const buf = await book.file.arrayBuffer();
-          await dbSavePDF(book.name, buf, book.size, book.modified);
-        } catch (e) { console.warn("Could not save to DB:", e); }
-      }
-      setLibrary(prev => {
-        const names = new Set(prev.map(b => b.name));
-        return [...prev, ...found.filter(b => !names.has(b.name))];
+      const page = await doc.getPage(pageNum);
+      const container = containerRef.current;
+      const availW = container ? container.clientWidth - 16 : window.innerWidth - 16;
+      const naturalVP = page.getViewport({ scale: 1 });
+      const fitScale = availW / naturalVP.width;
+      const scale = scaleOverride || fitScale;
+
+      // Use devicePixelRatio for sharp rendering (fixes blur!)
+      const dpr = window.devicePixelRatio || 1;
+      const vp = page.getViewport({ scale });
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext("2d");
+
+      // Physical pixels = CSS pixels × DPR
+      canvas.width = Math.floor(vp.width * dpr);
+      canvas.height = Math.floor(vp.height * dpr);
+      canvas.style.width = `${vp.width}px`;
+      canvas.style.height = `${vp.height}px`;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, vp.width, vp.height);
+
+      const task = page.render({
+        canvasContext: ctx,
+        viewport: vp,
+        intent: "display",
       });
-      showToast(`Found ${found.length} PDF${found.length > 1 ? "s" : ""}! Saved to library.`, "success");
+      renderTaskRef.current = task;
+      await task.promise;
+
+      if (!scaleOverride) {
+        setBaseZoom(fitScale);
+        setZoom(fitScale);
+      }
     } catch (e) {
-      setScanning(false);
-      if (e?.name !== "AbortError") showToast("Could not access folder.");
+      if (e?.name !== "RenderingCancelledException") console.error("Render:", e);
+    } finally {
+      setRendering(false);
+    }
+  }, []);
+
+  // Re-render when page or zoom changes
+  useEffect(() => {
+    if (pdfDoc) renderPage(pdfDoc, currentPage, zoom !== baseZoom ? zoom : null);
+  }, [pdfDoc, currentPage]);
+
+  // Re-render on zoom change with debounce
+  const zoomTimer = useRef(null);
+  useEffect(() => {
+    if (!pdfDoc) return;
+    clearTimeout(zoomTimer.current);
+    zoomTimer.current = setTimeout(() => {
+      renderPage(pdfDoc, currentPage, zoom);
+    }, 120);
+  }, [zoom]);
+
+  // ── Pinch to zoom ─────────────────────────────────────────────────────────
+  const handleTouchStart = (e) => {
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      pinchRef.current = {
+        active: true,
+        startDist: Math.hypot(dx, dy),
+        startZoom: zoom,
+      };
     }
   };
+  const handleTouchMove = (e) => {
+    if (!pinchRef.current.active || e.touches.length !== 2) return;
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.hypot(dx, dy);
+    const ratio = dist / pinchRef.current.startDist;
+    const newZoom = Math.max(0.5, Math.min(4, pinchRef.current.startZoom * ratio));
+    setZoom(parseFloat(newZoom.toFixed(2)));
+  };
+  const handleTouchEnd = () => { pinchRef.current.active = false; };
 
-  // ── Navigation ──
+  // ── Navigation ────────────────────────────────────────────────────────────
   const goToPage = (n) => {
     const p = Math.max(1, Math.min(n, numPages));
     setCurrentPage(p);
@@ -340,25 +408,30 @@ export default function PDFReader() {
       if (typeof dest === "string") dest = await pdfDoc.getDestination(dest);
       if (!dest) return;
       goToPage((await pdfDoc.getPageIndex(dest[0])) + 1);
-      setActivePanel(null);
+      setActivePanel(null); setReaderDrawerOpen(false);
     } catch {}
   };
 
-  // ── Bookmarks ──
+  // ── Bookmarks ─────────────────────────────────────────────────────────────
   const bookKey = currentBook?.name || "";
   const bookBookmarks = bookmarks[bookKey] || [];
   const isBookmarked = bookBookmarks.includes(currentPage);
   const toggleBookmark = () => {
     if (isBookmarked) {
       setBookmarks(p => ({ ...p, [bookKey]: bookBookmarks.filter(b => b !== currentPage) }));
-      showToast(`Removed from saved pages`);
+      showToast("Removed from saved pages");
     } else {
       setBookmarks(p => ({ ...p, [bookKey]: [...bookBookmarks, currentPage].sort((a, b) => a - b) }));
       showToast(`Page ${currentPage} saved!`, "success");
     }
   };
 
-  // ── Notes ──
+  // All bookmarks across all books
+  const allBookmarks = Object.entries(bookmarks).flatMap(([bName, pages]) =>
+    pages.map(pg => ({ bookName: bName, page: pg }))
+  );
+
+  // ── Notes ─────────────────────────────────────────────────────────────────
   const bookNotes = notes[bookKey] || {};
   const saveNote = () => {
     const updated = { ...bookNotes };
@@ -368,7 +441,7 @@ export default function PDFReader() {
     showToast(noteInput.trim() ? "Note saved!" : "Note deleted", "success");
   };
 
-  // ── Search ──
+  // ── Search ────────────────────────────────────────────────────────────────
   const getPageText = async (doc, p) => {
     if (textCache[p]) return textCache[p];
     const page = await doc.getPage(p);
@@ -377,7 +450,6 @@ export default function PDFReader() {
     setTextCache(prev => ({ ...prev, [p]: text }));
     return text;
   };
-
   const runSearch = async () => {
     if (!pdfDoc || !searchQuery.trim()) return;
     setSearching(true); setSearchResults([]);
@@ -398,68 +470,99 @@ export default function PDFReader() {
     }
     setSearchResults(results); setSearching(false);
     if (!results.length) showToast("No results found.");
-    else showToast(`Found on ${results.length} page${results.length > 1 ? "s" : ""}`, "success");
+    else showToast(`Found on ${results.length} page${results.length > 1 ? "s" : ""}!`, "success");
   };
 
-  // ── Theme ──
+  // ── Theme ─────────────────────────────────────────────────────────────────
   const d = dark;
-  const bg       = d ? "#111"     : "#f7f3ee";
-  const surface  = d ? "#1c1c1c"  : "#ffffff";
-  const panelBg  = d ? "#161616"  : "#fdfaf6";
-  const border   = d ? "#2a2a2a"  : "#e0d8cc";
-  const tx       = d ? "#e8e0d0"  : "#1a1208";
-  const muted    = d ? "#666"     : "#8a7a68";
-  const acc      = d ? "#c9a96e"  : "#b5681e";
-  const accLight = d ? "#c9a96e22" : "#b5681e14";
-  const inputBg  = d ? "#222"     : "#f5f0e8";
-  const canvasBg = d ? "#1a1818"  : "#e8e0d4";
-  const navBg    = d ? "#181818"  : "#ffffff";
+  const bg       = d ? "#111"    : "#f7f3ee";
+  const surface  = d ? "#1c1c1c" : "#ffffff";
+  const panelBg  = d ? "#181818" : "#fdfaf6";
+  const drawerBg = d ? "#161616" : "#ffffff";
+  const border   = d ? "#2a2a2a" : "#e0d8cc";
+  const tx       = d ? "#e8e0d0" : "#1a1208";
+  const muted    = d ? "#666"    : "#8a7a68";
+  const acc      = d ? "#c9a96e" : "#b5681e";
+  const accL     = d ? "#c9a96e22" : "#b5681e14";
+  const inputBg  = d ? "#222"    : "#f5f0e8";
+  const cvsBg    = d ? "#1a1818" : "#e8e0d4";
 
-  const filteredLib = library.filter(b =>
-    b.name.toLowerCase().includes(libSearch.toLowerCase())
-  );
+  // Recently opened books
+  const recentList = recentBooks
+    .map(name => library.find(b => b.name === name))
+    .filter(Boolean);
 
-  // ── Shared styles ──
-  const btn = (bg2, outline = false) => ({
+  const removeFromRecent = (name) => {
+    setRecentBooks(prev => prev.filter(n => n !== name));
+  };
+
+  // Style helpers
+  const panelStyle = {
+    position: "absolute", bottom: 0, left: 0, right: 0,
+    background: panelBg, borderTop: `2px solid ${border}`,
+    borderRadius: "20px 20px 0 0", padding: "16px 16px 100px",
+    maxHeight: "60vh", overflowY: "auto", zIndex: 50,
+    boxShadow: "0 -8px 40px #0003", animation: "slideUp .25s ease",
+  };
+  const pBtn = (bg2, outline = false) => ({
     background: outline ? "transparent" : bg2,
     border: `2px solid ${outline ? border : bg2}`,
     color: outline ? tx : "#fff",
     padding: "10px 18px", borderRadius: 12,
     fontSize: 13, fontWeight: 700, cursor: "pointer",
-    fontFamily: "inherit", transition: "all .15s",
-    whiteSpace: "nowrap",
+    fontFamily: "inherit", whiteSpace: "nowrap",
   });
-
-  const iconBtn = (col) => ({
-    background: "none", border: "none", cursor: "pointer",
-    color: col, fontSize: 20, padding: "6px 8px",
-    borderRadius: 8, lineHeight: 1,
-  });
-
-  const navBtn = (col, disabled) => ({
-    background: disabled ? "transparent" : col,
-    border: `2px solid ${disabled ? border : col}`,
+  const navBtn = (disabled) => ({
+    background: disabled ? "transparent" : acc,
+    border: `2px solid ${disabled ? border : acc}`,
     color: disabled ? muted : "#fff",
-    padding: "8px 14px", borderRadius: 10,
-    fontSize: 12, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
+    padding: "8px 16px", borderRadius: 10, fontSize: 12,
+    fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.5 : 1, fontFamily: "inherit",
   });
 
-  const panelStyle = {
-    position: "absolute", bottom: 0, left: 0, right: 0,
-    background: panelBg, borderTop: `2px solid ${border}`,
-    borderRadius: "18px 18px 0 0",
-    padding: "16px 16px 24px",
-    maxHeight: "55vh", overflowY: "auto",
-    zIndex: 50, boxShadow: "0 -8px 40px #0003",
-    animation: "slideUp .25s ease",
-  };
-
-  // ════════════ LIBRARY SCREEN ════════════════════════════════════════════════
+  // ════════════════ LIBRARY SCREEN ════════════════════════════════════════════
   if (screen === "library") return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh",
       background: bg, color: tx, fontFamily: "'Georgia','Book Antiqua',serif",
       overflow: "hidden" }}>
+
+      {/* Permission popup */}
+      {showPermPopup && storagePermission === "ask" && (
+        <div style={{ position: "fixed", inset: 0, background: "#0007",
+          zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center",
+          padding: 24 }}>
+          <div style={{ background: surface, borderRadius: 20, padding: 24,
+            maxWidth: 340, width: "100%", boxShadow: "0 8px 48px #0005" }}>
+            <div style={{ fontSize: 36, marginBottom: 12, textAlign: "center" }}>📂</div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: acc,
+              marginBottom: 8, textAlign: "center" }}>
+              Storage Access
+            </div>
+            <div style={{ fontSize: 14, color: muted, lineHeight: 1.7,
+              marginBottom: 20, textAlign: "center" }}>
+              Allow PDF Reader to scan your storage and find all PDF files automatically.
+              Your files stay on your device.
+            </div>
+            <button onClick={handleGrantPermission}
+              style={{ ...pBtn(acc), width: "100%", marginBottom: 10,
+                padding: "13px", fontSize: 15, borderRadius: 14 }}>
+              📂 Allow Storage Access
+            </button>
+            <button onClick={() => { setShowPermPopup(false); fileInputRef.current.click(); }}
+              style={{ ...pBtn(acc, true), width: "100%", marginBottom: 10,
+                padding: "12px", borderRadius: 14 }}>
+              Pick PDFs Manually
+            </button>
+            <button onClick={handleDontAskAgain}
+              style={{ background: "none", border: "none", width: "100%",
+                color: muted, fontSize: 12, cursor: "pointer", padding: "8px",
+                fontFamily: "inherit" }}>
+              Don't ask again
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Header */}
       <div style={{ background: surface, borderBottom: `1px solid ${border}`,
@@ -468,123 +571,168 @@ export default function PDFReader() {
         <span style={{ fontSize: 26 }}>📚</span>
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: 800, fontSize: 18, color: acc }}>My Library</div>
-          <div style={{ fontSize: 11, color: muted }}>{library.length} book{library.length !== 1 ? "s" : ""}</div>
+          <div style={{ fontSize: 11, color: muted }}>
+            {library.length} book{library.length !== 1 ? "s" : ""}
+          </div>
         </div>
-        <button onClick={() => setDark(!d)} style={iconBtn(acc)}>{d ? "☀️" : "🌙"}</button>
+        {scanning && <span style={{ fontSize: 12, color: acc }}>Scanning…</span>}
+        <button onClick={() => setDark(!d)}
+          style={{ background: "none", border: "none", fontSize: 20,
+            cursor: "pointer", color: acc }}>
+          {d ? "☀️" : "🌙"}
+        </button>
       </div>
 
-      {/* Search bar */}
-      {library.length > 0 && (
-        <div style={{ padding: "12px 16px", background: surface,
-          borderBottom: `1px solid ${border}` }}>
-          <input value={libSearch} onChange={e => setLibSearch(e.target.value)}
-            placeholder="🔍  Search books…"
-            style={{ width: "100%", padding: "10px 14px", borderRadius: 12,
-              border: `1px solid ${border}`, background: inputBg, color: tx,
-              fontSize: 14, fontFamily: "inherit", outline: "none",
-              boxSizing: "border-box" }} />
-        </div>
-      )}
+      {/* Body */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 12px 100px" }}>
 
-      {/* Book grid */}
-      <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
         {library.length === 0 ? (
-          /* Empty state */
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
             justifyContent: "center", minHeight: "70vh", gap: 16, textAlign: "center",
             padding: 24 }}>
             <div style={{ fontSize: 72 }}>📖</div>
             <div style={{ fontSize: 22, fontWeight: 800, color: acc }}>No books yet</div>
-            <div style={{ fontSize: 14, color: muted, maxWidth: 300, lineHeight: 1.8 }}>
-              Add PDF books from your device or scan a folder
-            </div>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center",
-              marginTop: 8 }}>
-              <button onClick={handleScanFolder} style={btn(acc)}>
-                📂 Scan Folder
-              </button>
-              <button onClick={() => fileInputRef.current.click()} style={btn(acc, true)}>
-                + Add PDF
-              </button>
+            <div style={{ fontSize: 14, color: muted, maxWidth: 280, lineHeight: 1.8 }}>
+              Tap the + button below to add your first PDF book
             </div>
           </div>
         ) : (
           <>
+            {/* Recently Opened */}
+            {recentList.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: muted,
+                  textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 12 }}>
+                  Recently Opened
+                </div>
+                <div style={{ display: "grid",
+                  gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+                  {recentList.slice(0, 3).map((book, i) => {
+                    const c = coverColor(book.name);
+                    return (
+                      <div key={i} style={{ position: "relative" }}>
+                        <div onClick={() => openBook(book)} style={{ cursor: "pointer" }}>
+                          <div style={{ position: "relative", borderRadius: "4px 8px 8px 4px",
+                            overflow: "hidden", marginBottom: 6,
+                            boxShadow: "3px 4px 14px #0002",
+                            aspectRatio: "2/3", background: c.bg }}>
+                            <div style={{ position: "absolute", left: 0, top: 0,
+                              bottom: 0, width: 10, background: c.spine }} />
+                            <div style={{ position: "absolute", left: 10, right: 0,
+                              top: 0, bottom: 0, display: "flex", flexDirection: "column",
+                              alignItems: "center", justifyContent: "center",
+                              padding: "10px 6px", gap: 6 }}>
+                              <div style={{ fontSize: 22 }}>📄</div>
+                              <div dir="auto" style={{ fontSize: 9, color: c.text,
+                                textAlign: "center", fontWeight: 700, lineHeight: 1.3,
+                                wordBreak: "break-word", display: "-webkit-box",
+                                WebkitLineClamp: 4, WebkitBoxOrient: "vertical",
+                                overflow: "hidden" }}>
+                                {book.name}
+                              </div>
+                            </div>
+                          </div>
+                          <div dir="auto" style={{ fontSize: 10, fontWeight: 700,
+                            color: tx, lineHeight: 1.3, display: "-webkit-box",
+                            WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
+                            overflow: "hidden" }}>
+                            {book.name}
+                          </div>
+                        </div>
+                        {/* Remove from recent */}
+                        <button onClick={() => removeFromRecent(book.name)}
+                          style={{ position: "absolute", top: 3, right: 3,
+                            background: "#000a", border: "none", borderRadius: "50%",
+                            width: 20, height: 20, cursor: "pointer", color: "#fff",
+                            fontSize: 12, display: "flex", alignItems: "center",
+                            justifyContent: "center", zIndex: 2 }}>
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Divider */}
+            {recentList.length > 0 && (
+              <div style={{ borderTop: `1px solid ${border}`, marginBottom: 16 }} />
+            )}
+
+            {/* All PDFs label */}
+            <div style={{ fontSize: 13, fontWeight: 800, color: muted,
+              textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 12 }}>
+              All Books ({library.length})
+            </div>
+
+            {/* Book grid — 3 per row */}
             <div style={{ display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 16,
-              marginBottom: 80 }}>
-              {filteredLib.map((book, i) => {
+              gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+              {library.map((book, i) => {
                 const c = coverColor(book.name);
                 const bms = (bookmarks[book.name] || []).length;
                 const pg = lastRead[book.name];
                 return (
-                  <div key={i} onClick={() => openBook(book)}
-                    style={{ cursor: "pointer", animation: `fadeIn .3s ease ${i * .04}s both` }}>
-                    {/* Cover */}
-                    <div style={{ position: "relative", borderRadius: "4px 10px 10px 4px",
-                      overflow: "hidden", marginBottom: 8,
-                      boxShadow: "4px 6px 20px #0002",
-                      aspectRatio: "2/3", background: c.bg,
-                      transition: "transform .2s, box-shadow .2s" }}
-                      onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-4px)"; e.currentTarget.style.boxShadow = "6px 12px 28px #0004"; }}
-                      onMouseLeave={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "4px 6px 20px #0002"; }}>
-                      {/* Spine */}
-                      <div style={{ position: "absolute", left: 0, top: 0, bottom: 0,
-                        width: 12, background: c.spine }} />
-                      {/* Content */}
-                      <div style={{ position: "absolute", left: 12, right: 0, top: 0, bottom: 0,
-                        display: "flex", flexDirection: "column", alignItems: "center",
-                        justifyContent: "center", padding: "14px 10px", gap: 8 }}>
-                        <div style={{ fontSize: 28 }}>📄</div>
-                        <div dir="auto" style={{ fontSize: 10, color: c.text, textAlign: "center",
-                          fontWeight: 700, lineHeight: 1.4, wordBreak: "break-word",
-                          display: "-webkit-box", WebkitLineClamp: 4,
-                          WebkitBoxOrient: "vertical", overflow: "hidden" }}>
-                          {book.name}
+                  <div key={i} style={{ position: "relative",
+                    animation: `fadeIn .3s ease ${i * .03}s both` }}>
+                    <div onClick={() => openBook(book)} style={{ cursor: "pointer" }}>
+                      <div style={{ position: "relative",
+                        borderRadius: "4px 8px 8px 4px", overflow: "hidden",
+                        marginBottom: 6, boxShadow: "3px 5px 16px #0002",
+                        aspectRatio: "2/3", background: c.bg,
+                        transition: "transform .2s" }}
+                        onMouseEnter={e => e.currentTarget.style.transform = "translateY(-3px)"}
+                        onMouseLeave={e => e.currentTarget.style.transform = ""}>
+                        <div style={{ position: "absolute", left: 0, top: 0,
+                          bottom: 0, width: 10, background: c.spine }} />
+                        <div style={{ position: "absolute", left: 10, right: 0,
+                          top: 0, bottom: 0, display: "flex", flexDirection: "column",
+                          alignItems: "center", justifyContent: "center",
+                          padding: "10px 6px", gap: 6 }}>
+                          <div style={{ fontSize: 22 }}>📄</div>
+                          <div dir="auto" style={{ fontSize: 9, color: c.text,
+                            textAlign: "center", fontWeight: 700, lineHeight: 1.3,
+                            wordBreak: "break-word", display: "-webkit-box",
+                            WebkitLineClamp: 4, WebkitBoxOrient: "vertical",
+                            overflow: "hidden" }}>
+                            {book.name}
+                          </div>
                         </div>
+                        {pg && (
+                          <div style={{ position: "absolute", bottom: 0,
+                            left: 10, right: 0, height: 3, background: "#fff2" }}>
+                            <div style={{ height: "100%", background: c.text,
+                              width: `${Math.min(100, (pg / 100) * 100)}%` }} />
+                          </div>
+                        )}
+                        {bms > 0 && (
+                          <div style={{ position: "absolute", top: 4, right: 4,
+                            background: "#000a", borderRadius: 6, padding: "1px 4px",
+                            fontSize: 8, color: "#fff" }}>🔖{bms}</div>
+                        )}
                       </div>
-                      {/* Progress */}
-                      {pg && (
-                        <div style={{ position: "absolute", bottom: 0, left: 12, right: 0,
-                          height: 3, background: "#fff2" }}>
-                          <div style={{ height: "100%", background: c.text, opacity: .8,
-                            width: `${Math.min(100, (pg / Math.max(1, numPages)) * 100)}%` }} />
-                        </div>
-                      )}
-                      {bms > 0 && (
-                        <div style={{ position: "absolute", top: 5, right: 5,
-                          background: "#000a", borderRadius: 8, padding: "2px 5px",
-                          fontSize: 9, color: "#fff" }}>🔖{bms}</div>
-                      )}
-                      {/* Delete button */}
-                      <button
-                        onClick={e => {
-                          e.stopPropagation();
-                          if (window.confirm(`Remove "${book.name}" from library?`)) {
-                            dbDeletePDF(book.name).catch(() => {});
-                            setLibrary(prev => prev.filter(b => b.name !== book.name));
-                            showToast("Removed from library");
-                          }
-                        }}
-                        style={{ position: "absolute", top: 5, left: 16,
-                          background: "#000a", border: "none", borderRadius: "50%",
-                          width: 22, height: 22, cursor: "pointer", color: "#fff",
-                          fontSize: 13, display: "flex", alignItems: "center",
-                          justifyContent: "center", lineHeight: 1 }}>
-                        ×
-                      </button>
+                      <div dir="auto" style={{ fontSize: 10, fontWeight: 700,
+                        color: tx, lineHeight: 1.3, display: "-webkit-box",
+                        WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
+                        overflow: "hidden" }}>
+                        {book.name}
+                      </div>
+                      {pg && <div style={{ fontSize: 9, color: acc }}>Pg {pg}</div>}
                     </div>
-                    {/* Title */}
-                    <div dir="auto" style={{ fontSize: 11, fontWeight: 700, color: tx,
-                      lineHeight: 1.4, marginBottom: 2, wordBreak: "break-word",
-                      display: "-webkit-box", WebkitLineClamp: 2,
-                      WebkitBoxOrient: "vertical", overflow: "hidden" }}>
-                      {book.name}
-                    </div>
-                    {pg && <div style={{ fontSize: 10, color: acc }}>Page {pg}</div>}
-                    <div style={{ fontSize: 10, color: muted }}>
-                      {(book.size / 1024 / 1024).toFixed(1)} MB
-                    </div>
+                    {/* Delete from library */}
+                    <button onClick={() => {
+                      if (window.confirm(`Remove "${book.name}"?`)) {
+                        dbDeletePDF(book.name).catch(() => {});
+                        setLibrary(prev => prev.filter(b => b.name !== book.name));
+                        setRecentBooks(prev => prev.filter(n => n !== book.name));
+                        showToast("Removed from library");
+                      }
+                    }} style={{ position: "absolute", top: 3, left: 13,
+                      background: "#000a", border: "none", borderRadius: "50%",
+                      width: 18, height: 18, cursor: "pointer", color: "#fff",
+                      fontSize: 11, display: "flex", alignItems: "center",
+                      justifyContent: "center" }}>×</button>
                   </div>
                 );
               })}
@@ -593,48 +741,202 @@ export default function PDFReader() {
         )}
       </div>
 
-      {/* Bottom add buttons */}
-      {library.length > 0 && (
-        <div style={{ position: "fixed", bottom: 0, left: 0, right: 0,
-          background: navBg, borderTop: `1px solid ${border}`,
-          padding: "12px 16px", display: "flex", gap: 10,
-          boxShadow: "0 -4px 20px #0001" }}>
-          <button onClick={handleScanFolder} disabled={scanning}
-            style={{ ...btn(acc), flex: 1 }}>
-            {scanning ? "Scanning…" : "📂 Scan Folder"}
-          </button>
-          <button onClick={() => fileInputRef.current.click()}
-            style={{ ...btn(acc, true), flex: 1 }}>
-            + Add PDF
-          </button>
-        </div>
+      {/* Floating + button — only show if no storage permission */}
+      {storagePermission !== "granted" && (
+        <button onClick={() => fileInputRef.current.click()}
+          style={{ position: "fixed", bottom: 28, left: "50%",
+            transform: "translateX(-50%)",
+            width: 60, height: 60, borderRadius: "50%",
+            background: acc, border: "none", cursor: "pointer",
+            fontSize: 32, color: "#fff", fontWeight: 300,
+            boxShadow: "0 6px 24px #0004",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            zIndex: 40, transition: "transform .15s" }}
+          onMouseEnter={e => e.currentTarget.style.transform = "translateX(-50%) scale(1.1)"}
+          onMouseLeave={e => e.currentTarget.style.transform = "translateX(-50%)"}>
+          +
+        </button>
       )}
 
       <input ref={fileInputRef} type="file" accept=".pdf,application/pdf"
         multiple style={{ display: "none" }}
         onChange={e => handleFiles(e.target.files)} />
 
-      {toast && <Toast msg={toast.msg} type={toast.type} acc={acc} surface={surface} tx={tx} border={border} />}
-      <style>{globalCSS}</style>
+      {toast && <Toast toast={toast} acc={acc} surface={surface} tx={tx} border={border} />}
+      <style>{CSS}</style>
     </div>
   );
 
-  // ════════════ READER SCREEN ═════════════════════════════════════════════════
+  // ════════════════ READER SCREEN ═════════════════════════════════════════════
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh",
       background: bg, color: tx, fontFamily: "'Georgia','Book Antiqua',serif",
       overflow: "hidden" }}>
 
+      {/* Drawer overlay */}
+      {readerDrawerOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "#0005",
+          zIndex: 80 }} onClick={() => { setReaderDrawerOpen(false); setAllBookmarksView(false); }} />
+      )}
+
+      {/* ── Left Drawer ── */}
+      <div style={{ position: "fixed", top: 0, left: 0, bottom: 0,
+        width: 280, background: drawerBg, zIndex: 90,
+        transform: readerDrawerOpen ? "translateX(0)" : "translateX(-100%)",
+        transition: "transform .25s ease",
+        display: "flex", flexDirection: "column",
+        boxShadow: readerDrawerOpen ? "4px 0 32px #0004" : "none" }}>
+
+        {/* Drawer header */}
+        <div style={{ padding: "16px 18px", borderBottom: `1px solid ${border}`,
+          display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 18 }}>📖</span>
+          <div style={{ flex: 1, fontSize: 13, fontWeight: 700, color: acc,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {currentBook?.name}
+          </div>
+          <button onClick={() => setReaderDrawerOpen(false)}
+            style={{ background: "none", border: "none", fontSize: 20,
+              cursor: "pointer", color: muted }}>×</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto" }}>
+
+          {/* All saved pages across all books */}
+          {!allBookmarksView ? (
+            <>
+              {[
+                { icon: "🔖", label: "Saved Pages", sub: `${bookBookmarks.length} saved`, action: () => { setActivePanel("saved"); setReaderDrawerOpen(false); } },
+                { icon: "📚", label: "All Saved Pages", sub: `${allBookmarks.length} across all books`, action: () => setAllBookmarksView(true) },
+                { icon: "🔢", label: "Go to Page", sub: `Current: ${currentPage} of ${numPages}`, action: () => { setActivePanel("goto"); setReaderDrawerOpen(false); } },
+                { icon: "🔍", label: "Search in PDF", sub: "Full text search", action: () => { setActivePanel("search"); setReaderDrawerOpen(false); } },
+                { icon: "✏️", label: "Notes", sub: `${Object.keys(bookNotes).length} note${Object.keys(bookNotes).length !== 1 ? "s" : ""} on this book`, action: () => { setActivePanel("notes"); setReaderDrawerOpen(false); } },
+                { icon: "📑", label: "Table of Contents", sub: toc.length > 0 ? `${toc.length} sections` : "Not available", action: () => { setActivePanel("toc"); setReaderDrawerOpen(false); } },
+              ].map((item, i) => (
+                <div key={i}>
+                  <div onClick={item.action}
+                    style={{ display: "flex", alignItems: "center", gap: 14,
+                      padding: "14px 18px", cursor: "pointer",
+                      transition: "background .15s" }}
+                    onMouseEnter={e => e.currentTarget.style.background = accL}
+                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                    <div style={{ fontSize: 22, width: 32, textAlign: "center" }}>{item.icon}</div>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: tx }}>{item.label}</div>
+                      <div style={{ fontSize: 11, color: muted }}>{item.sub}</div>
+                    </div>
+                  </div>
+                  {i < 5 && <div style={{ borderTop: `1px solid ${border}`, margin: "0 18px" }} />}
+                </div>
+              ))}
+
+              <div style={{ borderTop: `2px solid ${border}`, margin: "8px 0" }} />
+
+              {/* Theme toggle in drawer */}
+              <div onClick={() => setDark(!d)}
+                style={{ display: "flex", alignItems: "center", gap: 14,
+                  padding: "14px 18px", cursor: "pointer" }}
+                onMouseEnter={e => e.currentTarget.style.background = accL}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                <div style={{ fontSize: 22, width: 32, textAlign: "center" }}>{d ? "☀️" : "🌙"}</div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: tx }}>
+                    {d ? "Light Mode" : "Dark Mode"}
+                  </div>
+                  <div style={{ fontSize: 11, color: muted }}>Switch theme</div>
+                </div>
+              </div>
+
+              <div style={{ borderTop: `1px solid ${border}`, margin: "0 18px" }} />
+
+              {/* Back to library */}
+              <div onClick={() => { setScreen("library"); setPdfDoc(null); setReaderDrawerOpen(false); }}
+                style={{ display: "flex", alignItems: "center", gap: 14,
+                  padding: "14px 18px", cursor: "pointer" }}
+                onMouseEnter={e => e.currentTarget.style.background = accL}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                <div style={{ fontSize: 22, width: 32, textAlign: "center" }}>🏠</div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: tx }}>Back to Library</div>
+                  <div style={{ fontSize: 11, color: muted }}>Close this book</div>
+                </div>
+              </div>
+            </>
+          ) : (
+            /* All bookmarks view */
+            <>
+              <div style={{ padding: "12px 18px", display: "flex",
+                alignItems: "center", gap: 10 }}>
+                <button onClick={() => setAllBookmarksView(false)}
+                  style={{ background: "none", border: "none",
+                    cursor: "pointer", color: acc, fontSize: 14,
+                    fontFamily: "inherit", fontWeight: 700 }}>
+                  ← Back
+                </button>
+                <div style={{ fontSize: 14, fontWeight: 800, color: tx }}>
+                  All Saved Pages ({allBookmarks.length})
+                </div>
+              </div>
+              {allBookmarks.length === 0 ? (
+                <div style={{ textAlign: "center", color: muted,
+                  padding: "30px 20px", fontSize: 13 }}>
+                  No saved pages across any book yet.
+                </div>
+              ) : allBookmarks.map((item, i) => (
+                <div key={i}
+                  onClick={() => {
+                    const book = library.find(b => b.name === item.bookName);
+                    if (book) {
+                      openBook(book).then(() => {
+                        setTimeout(() => goToPage(item.page), 500);
+                      });
+                    }
+                    setAllBookmarksView(false); setReaderDrawerOpen(false);
+                  }}
+                  style={{ padding: "12px 18px", borderBottom: `1px solid ${border}`,
+                    cursor: "pointer" }}
+                  onMouseEnter={e => e.currentTarget.style.background = accL}
+                  onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: acc }}>
+                    Page {item.page}
+                  </div>
+                  <div style={{ fontSize: 11, color: muted, marginTop: 2,
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {item.bookName}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* Reading progress at bottom of drawer */}
+        <div style={{ padding: "14px 18px", borderTop: `1px solid ${border}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between",
+            fontSize: 11, color: muted, marginBottom: 6 }}>
+            <span>Reading Progress</span>
+            <span>{Math.round((currentPage / numPages) * 100)}%</span>
+          </div>
+          <div style={{ height: 6, background: border, borderRadius: 4 }}>
+            <div style={{ height: "100%", background: acc, borderRadius: 4,
+              width: `${(currentPage / numPages) * 100}%`,
+              transition: "width .3s" }} />
+          </div>
+          <div style={{ fontSize: 11, color: muted, marginTop: 6, textAlign: "center" }}>
+            Page {currentPage} of {numPages}
+          </div>
+        </div>
+      </div>
+
       {/* ── Top bar ── */}
       <div style={{ background: surface, borderBottom: `1px solid ${border}`,
-        padding: "10px 14px", display: "flex", alignItems: "center", gap: 8,
+        padding: "10px 14px", display: "flex", alignItems: "center", gap: 10,
         flexShrink: 0 }}>
-        {/* Back */}
-        <button onClick={() => { setScreen("library"); setPdfDoc(null); setActivePanel(null); }}
-          style={{ ...btn(acc, true), padding: "7px 12px", fontSize: 12 }}>
-          ← Library
+        <button onClick={() => { setReaderDrawerOpen(true); setAllBookmarksView(false); }}
+          style={{ background: "none", border: "none", fontSize: 22,
+            cursor: "pointer", color: acc, padding: "4px 6px" }}>
+          ☰
         </button>
-        {/* Title */}
         <div style={{ flex: 1, overflow: "hidden" }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: acc,
             whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -645,41 +947,46 @@ export default function PDFReader() {
           </div>
         </div>
         {/* Zoom controls */}
-        <button onClick={() => setZoom(z => Math.max(.5, +(z - .2).toFixed(1)))}
-          style={iconBtn(muted)}>−</button>
-        <span style={{ fontSize: 11, color: muted, minWidth: 36, textAlign: "center" }}>
+        <button onClick={() => setZoom(z => Math.max(0.5, parseFloat((z - 0.2).toFixed(1))))}
+          style={{ background: "none", border: "none", fontSize: 20,
+            cursor: "pointer", color: muted, padding: "4px 6px" }}>−</button>
+        <span style={{ fontSize: 11, color: muted, minWidth: 38, textAlign: "center" }}>
           {Math.round(zoom * 100)}%
         </span>
-        <button onClick={() => setZoom(z => Math.min(3, +(z + .2).toFixed(1)))}
-          style={iconBtn(muted)}>+</button>
-        <button onClick={() => setDark(!d)} style={iconBtn(acc)}>{d ? "☀️" : "🌙"}</button>
+        <button onClick={() => setZoom(z => Math.min(4, parseFloat((z + 0.2).toFixed(1))))}
+          style={{ background: "none", border: "none", fontSize: 20,
+            cursor: "pointer", color: muted, padding: "4px 6px" }}>+</button>
       </div>
 
       {/* ── Canvas ── */}
       <div ref={containerRef}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
         style={{ flex: 1, overflowY: "auto", overflowX: "auto",
-          background: canvasBg, display: "flex",
+          background: cvsBg, display: "flex",
           flexDirection: "column", alignItems: "center",
-          padding: "16px 0 120px" }}
+          padding: "12px 8px 130px",
+          WebkitOverflowScrolling: "touch" }}
         onClick={() => activePanel && setActivePanel(null)}>
 
         {rendering && (
-          <div style={{ position: "fixed", top: 60, left: "50%",
+          <div style={{ position: "fixed", top: 58, left: "50%",
             transform: "translateX(-50%)", background: surface,
-            color: acc, padding: "6px 16px", borderRadius: 20, fontSize: 12,
+            color: acc, padding: "5px 14px", borderRadius: 20, fontSize: 11,
             border: `1px solid ${acc}`, zIndex: 30 }}>
             Rendering…
           </div>
         )}
 
-        <div style={{ boxShadow: "0 4px 32px #0003", display: "inline-block" }}>
-          <canvas ref={canvasRef}
-            style={{ display: "block", maxWidth: "100%" }} />
+        <div style={{ boxShadow: "0 4px 32px #0003", display: "inline-block",
+          lineHeight: 0 }}>
+          <canvas ref={canvasRef} style={{ display: "block" }} />
         </div>
 
-        {/* Note display */}
         {bookNotes[currentPage] && (
-          <div dir="auto" style={{ margin: "14px 16px 0", maxWidth: 600, width: "calc(100% - 32px)",
+          <div dir="auto" style={{ margin: "12px 8px 0",
+            maxWidth: 600, width: "calc(100% - 16px)",
             background: surface, border: `1px solid ${acc}44`,
             borderRadius: 12, padding: "10px 14px",
             fontSize: 13, color: muted, fontStyle: "italic" }}>
@@ -693,91 +1000,91 @@ export default function PDFReader() {
 
       {/* ── Bottom navigation ── */}
       <div style={{ position: "fixed", bottom: 0, left: 0, right: 0,
-        background: navBg, borderTop: `2px solid ${border}`,
+        background: surface, borderTop: `2px solid ${border}`,
         zIndex: 40, boxShadow: "0 -4px 20px #0002" }}>
 
-        {/* Page prev/next row */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-          padding: "10px 14px 6px", gap: 8 }}>
-          <button onClick={() => goToPage(currentPage - 1)} disabled={currentPage === 1}
-            style={navBtn(acc, currentPage === 1)}>
-            ◀ Previous
+        {/* Prev / page indicator / next */}
+        <div style={{ display: "flex", alignItems: "center",
+          justifyContent: "space-between", padding: "10px 14px 6px", gap: 8 }}>
+          <button onClick={() => goToPage(1)}
+            disabled={currentPage === 1} style={{ ...navBtn(currentPage === 1), padding: "6px 10px", fontSize: 11 }}>
+            ⏮
           </button>
-
-          {/* Page indicator */}
+          <button onClick={() => goToPage(currentPage - 1)}
+            disabled={currentPage === 1} style={navBtn(currentPage === 1)}>
+            ◀ Prev
+          </button>
           <div style={{ textAlign: "center", flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: acc }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: acc }}>
               {currentPage} / {numPages}
             </div>
-            <div style={{ height: 3, background: border, borderRadius: 3, marginTop: 4 }}>
+            <div style={{ height: 3, background: border, borderRadius: 3, marginTop: 3 }}>
               <div style={{ height: "100%", background: acc, borderRadius: 3,
-                width: `${(currentPage / numPages) * 100}%`, transition: "width .3s" }} />
+                width: `${(currentPage / numPages) * 100}%`,
+                transition: "width .3s" }} />
             </div>
           </div>
-
-          <button onClick={() => goToPage(currentPage + 1)} disabled={currentPage === numPages}
-            style={navBtn(acc, currentPage === numPages)}>
+          <button onClick={() => goToPage(currentPage + 1)}
+            disabled={currentPage === numPages} style={navBtn(currentPage === numPages)}>
             Next ▶
+          </button>
+          <button onClick={() => goToPage(numPages)}
+            disabled={currentPage === numPages} style={{ ...navBtn(currentPage === numPages), padding: "6px 10px", fontSize: 11 }}>
+            ⏭
           </button>
         </div>
 
-        {/* Action buttons row */}
+        {/* Action tabs */}
         <div style={{ display: "flex", borderTop: `1px solid ${border}` }}>
           {[
-            { key: "saved",  icon: "🔖", label: "Saved Pages" },
-            { key: "goto",   icon: "🔢", label: "Go to Page" },
+            { key: "saved",  icon: "🔖", label: "Saved" },
+            { key: "goto",   icon: "🔢", label: "Go to" },
             { key: "search", icon: "🔍", label: "Search" },
             { key: "notes",  icon: "✏️",  label: "Notes" },
             { key: "toc",    icon: "📑", label: "Contents" },
           ].map(item => (
             <button key={item.key}
               onClick={() => setActivePanel(activePanel === item.key ? null : item.key)}
-              style={{ flex: 1, background: activePanel === item.key ? accLight : "transparent",
+              style={{ flex: 1, background: activePanel === item.key ? accL : "transparent",
                 border: "none", cursor: "pointer", padding: "8px 2px",
                 borderTop: activePanel === item.key ? `2px solid ${acc}` : "2px solid transparent",
                 color: activePanel === item.key ? acc : muted,
                 fontFamily: "inherit", transition: "all .15s" }}>
-              <div style={{ fontSize: 16 }}>{item.icon}</div>
-              <div style={{ fontSize: 9, fontWeight: 600, marginTop: 2,
-                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {item.label}
-              </div>
+              <div style={{ fontSize: 15 }}>{item.icon}</div>
+              <div style={{ fontSize: 9, fontWeight: 700, marginTop: 1 }}>{item.label}</div>
             </button>
           ))}
         </div>
       </div>
 
-      {/* ── Panels (slide up from bottom) ── */}
+      {/* ── Panels ── */}
       {activePanel && (
         <div style={panelStyle}>
-          {/* Handle bar */}
           <div style={{ width: 40, height: 4, background: border, borderRadius: 4,
-            margin: "0 auto 16px", cursor: "pointer" }}
+            margin: "0 auto 14px", cursor: "pointer" }}
             onClick={() => setActivePanel(null)} />
 
-          {/* ── SAVED PAGES ── */}
+          {/* SAVED PAGES */}
           {activePanel === "saved" && (
             <>
               <div style={{ display: "flex", justifyContent: "space-between",
                 alignItems: "center", marginBottom: 14 }}>
-                <div style={{ fontSize: 16, fontWeight: 800, color: tx }}>
-                  🔖 Saved Pages
-                </div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: tx }}>🔖 Saved Pages</div>
                 <button onClick={toggleBookmark}
-                  style={{ ...btn(isBookmarked ? "#b85c1e" : acc), padding: "7px 14px", fontSize: 12 }}>
-                  {isBookmarked ? "Remove This Page" : `Save Page ${currentPage}`}
+                  style={{ ...pBtn(isBookmarked ? "#c0392b" : acc), padding: "7px 14px", fontSize: 12 }}>
+                  {isBookmarked ? "Remove Page" : `Save Page ${currentPage}`}
                 </button>
               </div>
               {bookBookmarks.length === 0 ? (
                 <div style={{ textAlign: "center", color: muted, padding: "20px 0", fontSize: 14 }}>
-                  No saved pages yet.<br />
-                  <span style={{ fontSize: 12 }}>Press "Save Page" to bookmark the current page.</span>
+                  No saved pages yet. Press "Save Page" to bookmark.
                 </div>
               ) : bookBookmarks.map(pg => (
                 <div key={pg}
-                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-                    padding: "12px 14px", borderRadius: 12, marginBottom: 6, cursor: "pointer",
-                    background: pg === currentPage ? accLight : inputBg,
+                  style={{ display: "flex", alignItems: "center",
+                    justifyContent: "space-between", padding: "12px 14px",
+                    borderRadius: 12, marginBottom: 8, cursor: "pointer",
+                    background: pg === currentPage ? accL : inputBg,
                     border: `1px solid ${pg === currentPage ? acc : border}` }}
                   onClick={() => { goToPage(pg); setActivePanel(null); }}>
                   <div>
@@ -786,21 +1093,19 @@ export default function PDFReader() {
                       Page {pg}
                     </div>
                     {bookNotes[pg] && (
-                      <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>
-                        ✏️ Has a note
-                      </div>
+                      <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>✏️ Has a note</div>
                     )}
                   </div>
                   <button onClick={e => { e.stopPropagation();
                     setBookmarks(p => ({ ...p, [bookKey]: bookBookmarks.filter(b => b !== pg) })); }}
-                    style={{ background: "none", border: "none", cursor: "pointer",
-                      color: muted, fontSize: 18 }}>×</button>
+                    style={{ background: "none", border: "none",
+                      cursor: "pointer", color: muted, fontSize: 20 }}>×</button>
                 </div>
               ))}
             </>
           )}
 
-          {/* ── GO TO PAGE ── */}
+          {/* GO TO PAGE */}
           {activePanel === "goto" && (
             <>
               <div style={{ fontSize: 16, fontWeight: 800, color: tx, marginBottom: 14 }}>
@@ -809,28 +1114,36 @@ export default function PDFReader() {
               <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
                 <input type="number" value={goInput}
                   onChange={e => setGoInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === "Enter") { goToPage(parseInt(goInput)); setGoInput(""); setActivePanel(null); } }}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") {
+                      goToPage(parseInt(goInput));
+                      setGoInput(""); setActivePanel(null);
+                    }
+                  }}
                   placeholder={`Enter page (1 – ${numPages})`}
                   min={1} max={numPages}
                   style={{ flex: 1, padding: "12px 14px", borderRadius: 12,
                     border: `2px solid ${border}`, background: inputBg,
                     color: tx, fontSize: 15, fontFamily: "inherit", outline: "none" }} />
-                <button onClick={() => { goToPage(parseInt(goInput)); setGoInput(""); setActivePanel(null); }}
-                  style={{ ...btn(acc), padding: "12px 20px" }}>
+                <button
+                  onClick={() => { goToPage(parseInt(goInput)); setGoInput(""); setActivePanel(null); }}
+                  style={{ ...pBtn(acc), padding: "12px 20px" }}>
                   Go
                 </button>
               </div>
-              {/* Quick jump buttons */}
               <div style={{ fontSize: 12, color: muted, marginBottom: 8 }}>Quick jump:</div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {[1, Math.floor(numPages / 4), Math.floor(numPages / 2),
-                  Math.floor(numPages * 3 / 4), numPages]
+                {[1, Math.floor(numPages * 0.25), Math.floor(numPages * 0.5),
+                  Math.floor(numPages * 0.75), numPages]
                   .filter((v, i, a) => v > 0 && a.indexOf(v) === i)
                   .map(pg => (
-                    <button key={pg} onClick={() => { goToPage(pg); setActivePanel(null); }}
-                      style={{ ...btn(pg === currentPage ? acc : inputBg, pg !== currentPage),
-                        border: `1px solid ${border}`, color: pg === currentPage ? "#fff" : tx,
-                        padding: "8px 14px", fontSize: 12 }}>
+                    <button key={pg}
+                      onClick={() => { goToPage(pg); setActivePanel(null); }}
+                      style={{ background: pg === currentPage ? acc : inputBg,
+                        border: `1px solid ${pg === currentPage ? acc : border}`,
+                        color: pg === currentPage ? "#fff" : tx,
+                        padding: "8px 14px", borderRadius: 10, fontSize: 12,
+                        cursor: "pointer", fontFamily: "inherit" }}>
                       {pg === 1 ? "First" : pg === numPages ? "Last" : `Page ${pg}`}
                     </button>
                   ))}
@@ -838,7 +1151,7 @@ export default function PDFReader() {
             </>
           )}
 
-          {/* ── SEARCH ── */}
+          {/* SEARCH */}
           {activePanel === "search" && (
             <>
               <div style={{ fontSize: 16, fontWeight: 800, color: tx, marginBottom: 14 }}>
@@ -847,11 +1160,11 @@ export default function PDFReader() {
               <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
                 <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
                   onKeyDown={e => e.key === "Enter" && runSearch()}
-                  placeholder="Type to search entire PDF…" dir="auto"
+                  placeholder="Search entire PDF…" dir="auto"
                   style={{ flex: 1, padding: "12px 14px", borderRadius: 12,
                     border: `2px solid ${border}`, background: inputBg,
                     color: tx, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
-                <button onClick={runSearch} style={{ ...btn(acc), padding: "12px 18px" }}>
+                <button onClick={runSearch} style={{ ...pBtn(acc), padding: "12px 18px" }}>
                   Search
                 </button>
               </div>
@@ -860,15 +1173,16 @@ export default function PDFReader() {
                   Searching all {numPages} pages…
                 </div>
               )}
-              {!searching && searchResults.length === 0 && searchQuery && (
+              {!searching && searchQuery && !searchResults.length && (
                 <div style={{ textAlign: "center", color: muted, padding: 12 }}>
                   No results found for "{searchQuery}"
                 </div>
               )}
               {searchResults.map((r, i) => (
-                <div key={i} onClick={() => { goToPage(r.page); setActivePanel(null); }}
+                <div key={i}
+                  onClick={() => { goToPage(r.page); setActivePanel(null); }}
                   style={{ padding: "12px 14px", borderRadius: 12, marginBottom: 8,
-                    background: r.page === currentPage ? accLight : inputBg,
+                    background: r.page === currentPage ? accL : inputBg,
                     border: `1px solid ${r.page === currentPage ? acc : border}`,
                     cursor: "pointer" }}>
                   <div style={{ fontSize: 13, fontWeight: 700,
@@ -886,10 +1200,10 @@ export default function PDFReader() {
             </>
           )}
 
-          {/* ── NOTES ── */}
+          {/* NOTES */}
           {activePanel === "notes" && (
             <>
-              <div style={{ fontSize: 16, fontWeight: 800, color: tx, marginBottom: 6 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: tx, marginBottom: 8 }}>
                 ✏️ Note for Page {currentPage}
               </div>
               <textarea value={noteInput} onChange={e => setNoteInput(e.target.value)}
@@ -898,33 +1212,36 @@ export default function PDFReader() {
                   borderRadius: 12, border: `2px solid ${border}`,
                   background: inputBg, color: tx, fontSize: 14,
                   fontFamily: "inherit", resize: "vertical",
-                  boxSizing: "border-box", outline: "none", lineHeight: 1.6,
-                  marginBottom: 10 }} />
-              <div style={{ display: "flex", gap: 10 }}>
-                <button onClick={saveNote} style={{ ...btn(acc), flex: 1 }}>
+                  boxSizing: "border-box", outline: "none",
+                  lineHeight: 1.6, marginBottom: 10 }} />
+              <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+                <button onClick={saveNote} style={{ ...pBtn(acc), flex: 1 }}>
                   Save Note
                 </button>
                 {bookNotes[currentPage] && (
-                  <button onClick={() => { setNoteInput("");
-                    const u = { ...bookNotes }; delete u[currentPage];
+                  <button onClick={() => {
+                    setNoteInput("");
+                    const u = { ...bookNotes };
+                    delete u[currentPage];
                     setNotes(p => ({ ...p, [bookKey]: u }));
-                    showToast("Note deleted"); }}
-                    style={{ ...btn(acc, true), flex: 1 }}>
-                    Delete Note
+                    showToast("Note deleted");
+                  }} style={{ ...pBtn(acc, true), flex: 1 }}>
+                    Delete
                   </button>
                 )}
               </div>
-              {/* All notes list */}
               {Object.keys(bookNotes).length > 0 && (
-                <div style={{ marginTop: 16 }}>
-                  <div style={{ fontSize: 12, color: muted, marginBottom: 8,
-                    fontWeight: 700, textTransform: "uppercase", letterSpacing: ".06em" }}>
-                    All Notes
+                <>
+                  <div style={{ fontSize: 11, color: muted, fontWeight: 700,
+                    textTransform: "uppercase", letterSpacing: ".06em", marginBottom: 8 }}>
+                    All Notes in This Book
                   </div>
                   {Object.entries(bookNotes).sort(([a], [b]) => Number(a) - Number(b)).map(([pg, note]) => (
-                    <div key={pg} onClick={() => { goToPage(Number(pg)); setActivePanel(null); }}
+                    <div key={pg}
+                      onClick={() => { goToPage(Number(pg)); setActivePanel(null); }}
                       style={{ padding: "10px 12px", borderRadius: 10, marginBottom: 6,
-                        cursor: "pointer", background: Number(pg) === currentPage ? accLight : inputBg,
+                        cursor: "pointer",
+                        background: Number(pg) === currentPage ? accL : inputBg,
                         border: `1px solid ${Number(pg) === currentPage ? acc : border}` }}>
                       <div style={{ fontSize: 12, color: acc, fontWeight: 700 }}>
                         Page {pg}
@@ -935,33 +1252,34 @@ export default function PDFReader() {
                       </div>
                     </div>
                   ))}
-                </div>
+                </>
               )}
             </>
           )}
 
-          {/* ── TABLE OF CONTENTS ── */}
+          {/* TABLE OF CONTENTS */}
           {activePanel === "toc" && (
             <>
               <div style={{ fontSize: 16, fontWeight: 800, color: tx, marginBottom: 14 }}>
                 📑 Table of Contents
               </div>
               {toc.length === 0 ? (
-                <div style={{ textAlign: "center", color: muted, padding: "20px 0", fontSize: 14 }}>
+                <div style={{ textAlign: "center", color: muted,
+                  padding: "20px 0", fontSize: 14 }}>
                   This PDF has no table of contents.
                 </div>
               ) : toc.map((item, i) => (
-                <div key={i} dir="auto" onClick={() => navigateToc(item)}
+                <div key={i} dir="auto"
+                  onClick={() => navigateToc(item)}
                   style={{ padding: "10px 12px",
                     paddingLeft: 12 + item.depth * 16,
                     borderRadius: 10, cursor: "pointer", marginBottom: 4,
                     fontSize: item.depth === 0 ? 14 : 12,
                     fontWeight: item.depth === 0 ? 700 : 400,
                     color: item.depth === 0 ? acc : tx,
-                    background: "transparent",
                     borderLeft: item.depth > 0 ? `2px solid ${border}` : "none",
                     transition: "background .15s" }}
-                  onMouseEnter={e => e.currentTarget.style.background = accLight}
+                  onMouseEnter={e => e.currentTarget.style.background = accL}
                   onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                   {item.title}
                 </div>
@@ -971,45 +1289,43 @@ export default function PDFReader() {
         </div>
       )}
 
-      {toast && <Toast msg={toast.msg} type={toast.type} acc={acc} surface={surface} tx={tx} border={border} />}
-      <style>{globalCSS}</style>
+      {toast && <Toast toast={toast} acc={acc} surface={surface} tx={tx} border={border} />}
+      <style>{CSS}</style>
     </div>
   );
 }
 
-// ── Shared components ─────────────────────────────────────────────────────────
-function Toast({ msg, type, acc, surface, tx, border }) {
+function Toast({ toast, acc, surface, tx, border }) {
   return (
-    <div style={{ position: "fixed", bottom: 130, left: "50%",
+    <div style={{ position: "fixed", bottom: 120, left: "50%",
       transform: "translateX(-50%)",
-      background: type === "success" ? acc : surface,
-      color: type === "success" ? "#fff" : tx,
+      background: toast.type === "success" ? acc : surface,
+      color: toast.type === "success" ? "#fff" : tx,
       padding: "10px 22px", borderRadius: 24, fontSize: 13,
       boxShadow: "0 4px 28px #0004", border: `1px solid ${border}`,
-      zIndex: 500, whiteSpace: "nowrap",
-      animation: "fadeUp .2s ease" }}>
-      {msg}
+      zIndex: 500, whiteSpace: "nowrap", animation: "fadeUp .2s ease" }}>
+      {toast.msg}
     </div>
   );
 }
 
-const globalCSS = `
+const CSS = `
   @keyframes fadeUp {
-    from { opacity:0; transform:translateX(-50%) translateY(10px) }
-    to   { opacity:1; transform:translateX(-50%) translateY(0) }
+    from{opacity:0;transform:translateX(-50%) translateY(10px)}
+    to{opacity:1;transform:translateX(-50%) translateY(0)}
   }
   @keyframes slideUp {
-    from { transform:translateY(100%) }
-    to   { transform:translateY(0) }
+    from{transform:translateY(100%)}
+    to{transform:translateY(0)}
   }
   @keyframes fadeIn {
-    from { opacity:0; transform:translateY(8px) }
-    to   { opacity:1; transform:translateY(0) }
+    from{opacity:0;transform:translateY(6px)}
+    to{opacity:1;transform:translateY(0)}
   }
-  ::-webkit-scrollbar { width:4px; height:4px }
-  ::-webkit-scrollbar-track { background:transparent }
-  ::-webkit-scrollbar-thumb { background:#8885; border-radius:4px }
-  input::-webkit-inner-spin-button { opacity:.5 }
-  * { box-sizing:border-box }
-  input:focus, textarea:focus { outline:none }
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:#8886;border-radius:4px}
+  input::-webkit-inner-spin-button{opacity:.5}
+  *{box-sizing:border-box}
+  input:focus,textarea:focus{outline:none}
 `;
