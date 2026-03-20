@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PLACE THIS FILE AT:
+  android/app/src/main/AndroidManifest.xml
+  (Replace the existing one after running: npx cap add android)
+
+  FIX 1: Storage permissions for Android 10, 11, 12, 13+
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ═══ STORAGE PERMISSIONS ═══════════════════════════════════════════════
+
+         Android 9 and below: READ_EXTERNAL_STORAGE is enough
+         Android 10 (API 29): requestLegacyExternalStorage needed
+         Android 11 (API 30+): MANAGE_EXTERNAL_STORAGE for broad access
+         Android 13 (API 33+): READ_MEDIA_DOCUMENTS replaces READ_EXTERNAL_STORAGE
+    -->
+
+    <!-- For Android 9 and below -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- For Android 13+ (scoped media permissions) -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"
+        android:minSdkVersion="33" />
+    <uses-permission android:name="android.permission.READ_MEDIA_DOCUMENTS"
+        android:minSdkVersion="33" />
+
+    <!-- Required for webkitdirectory file picker in WebView -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Speech synthesis (Voice Reader feature) -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="true">
+        <!--
+            requestLegacyExternalStorage="true"
+            ↑ This is the KEY fix for Android 10 (API 29)
+              Without this, file access via webkitdirectory breaks on Android 10.
+              Has no effect on Android 11+ (scoped storage is enforced there)
+        -->
+
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:name="com.pdfreader.bookapp.MainActivity"
+            android:label="@string/title_activity_main"
+            android:launchMode="singleTask"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                FIX 1: Allow opening PDF files directly from file manager
+                When user taps a .pdf file, this app appears as an option
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+
+        </activity>
+
+        <!-- Provider needed for file sharing between apps -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+
+</manifest>
