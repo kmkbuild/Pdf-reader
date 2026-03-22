@@ -16,7 +16,7 @@ function loadScript(src) {
 // ── IndexedDB ─────────────────────────────────────────────────────────────────
 function openDB() {
   return new Promise((res, rej) => {
-    const r = indexedDB.open("PDFReaderDB", 2);
+    const r = indexedDB.open("PDFReaderDB", 3); // version 3 — adds thumbnails store
     r.onupgradeneeded = e => {
       const db = e.target.result;
       if (!db.objectStoreNames.contains("pdfs"))
@@ -27,6 +27,9 @@ function openDB() {
         db.createObjectStore("bookmarks", { keyPath: "bookName" });
       if (!db.objectStoreNames.contains("notes"))
         db.createObjectStore("notes", { keyPath: "bookName" });
+      // FIX ii: thumbnail cache store
+      if (!db.objectStoreNames.contains("thumbs"))
+        db.createObjectStore("thumbs", { keyPath: "name" });
     };
     r.onsuccess = e => res(e.target.result);
     r.onerror = e => rej(e.target.error);
@@ -116,6 +119,28 @@ async function dbGetAllNotes() {
     r.onerror = e => rej(e.target.error);
   });
 }
+// FIX ii: thumbnail store helpers
+async function dbSaveThumb(name, dataUrl) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("thumbs", "readwrite");
+    tx.objectStore("thumbs").put({ name, dataUrl });
+    tx.oncomplete = res; tx.onerror = e => rej(e.target.error);
+  });
+}
+async function dbGetAllThumbs() {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("thumbs", "readonly");
+    const r = tx.objectStore("thumbs").getAll();
+    r.onsuccess = e => {
+      const map = {};
+      (e.target.result || []).forEach(row => { map[row.name] = row.dataUrl; });
+      res(map);
+    };
+    r.onerror = e => rej(e.target.error);
+  });
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getGreeting() {
@@ -153,23 +178,42 @@ async function scanDir(dh, depth = 0, onFound) {
   } catch {}
 }
 
+// FIX ii: Generate thumbnail from PDF first page
+async function generateThumb(buf, name) {
+  try {
+    if (!window.pdfjsLib) return null;
+    const doc = await window.pdfjsLib.getDocument({
+      data: buf.slice(0), // slice so original buffer stays usable
+      cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/standard_fonts/`,
+      disableFontFace: false,
+      useSystemFonts: true,
+    }).promise;
+    const page = await doc.getPage(1);
+    const vp = page.getViewport({ scale: 0.3 }); // small thumbnail
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(vp.width);
+    canvas.height = Math.floor(vp.height);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp, intent: "print" }).promise;
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+    doc.destroy();
+    return dataUrl;
+  } catch {
+    return null;
+  }
+}
+
 // ── Design tokens ─────────────────────────────────────────────────────────────
 const C = {
-  bg0:    "#03050f",
-  bg1:    "#070d1a",
-  bg2:    "#0c1428",
-  bg3:    "#101e38",
-  glass:  "rgba(12,20,40,0.80)",
-  glow:   "#2563eb",
-  purple: "#7c3aed",
-  neon:   "#3b82f6",
-  neonL:  "#60a5fa",
-  purpleL:"#a78bfa",
-  border: "rgba(59,130,246,0.18)",
-  borderG:"rgba(59,130,246,0.50)",
-  tx:     "#e2e8f0",
-  txM:    "#64748b",
-  txD:    "#1e293b",
+  bg0: "#03050f", bg1: "#070d1a", bg2: "#0c1428", bg3: "#101e38",
+  glass: "rgba(12,20,40,0.80)", glow: "#2563eb", purple: "#7c3aed",
+  neon: "#3b82f6", neonL: "#60a5fa", purpleL: "#a78bfa",
+  border: "rgba(59,130,246,0.18)", borderG: "rgba(59,130,246,0.50)",
+  tx: "#e2e8f0", txM: "#64748b", txD: "#1e293b",
 };
 const glassBtn = (extra={}) => ({
   background: C.glass, backdropFilter:"blur(12px)",
@@ -190,13 +234,13 @@ const glassCard = (active=false) => ({
 
 // ══════════════════════════════════════════════════════════════════════════════
 export default function App() {
-  // Screen state — no tabs, just "home" or "reader"
   const [screen, setScreen] = useState("home");
   const [pdfjsReady, setPdfjsReady] = useState(false);
   const [dark, setDark] = useState(true);
 
   // Library
   const [library, setLibrary] = useState([]);
+  const [thumbs, setThumbs] = useState({}); // FIX ii: thumbnail cache
   const [recentBooks, setRecentBooks] = useState([]);
   const [libSearch, setLibSearch] = useState("");
   const [scanning, setScanning] = useState(false);
@@ -205,11 +249,11 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [showPerm, setShowPerm] = useState(false);
   const [permState, setPermState] = useState("unknown");
-  const [plusPressed, setPlusPressed] = useState(false); // weighted press effect
+  const [plusPressed, setPlusPressed] = useState(false);
 
   // Drawer
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [drawerView, setDrawerView] = useState("menu"); // "menu" | "allsaved"
+  const [drawerView, setDrawerView] = useState("menu");
 
   // Reader
   const [pdfDoc, setPdfDoc] = useState(null);
@@ -246,7 +290,7 @@ export default function App() {
   const utterRef = useRef(null);
   const restoredRef = useRef(false);
 
-  // Refs for back button — always fresh values
+  // Refs for back button
   const screenRef = useRef("home");
   const activePanelRef = useRef(null);
   const drawerRef = useRef(false);
@@ -270,16 +314,18 @@ export default function App() {
             size: r.size, modified: r.modified,
           })));
         }
-        const [bm, nt, lr, rb, perm, dk] = await Promise.all([
+        const [bm, nt, lr, rb, perm, dk, th] = await Promise.all([
           dbGetAllBookmarks(), dbGetAllNotes(),
           dbGet("lastRead"), dbGet("recentBooks"),
           dbGet("permState"), dbGet("dark"),
+          dbGetAllThumbs(), // FIX ii
         ]);
         if (bm && Object.keys(bm).length) setBookmarks(bm);
         if (nt && Object.keys(nt).length) setNotes(nt);
         if (lr) setLastRead(lr);
         if (rb) setRecentBooks(rb);
         if (dk !== null) setDark(dk);
+        if (th && Object.keys(th).length) setThumbs(th); // FIX ii
         if (perm==="granted"||perm==="skipped") setPermState(perm);
         else setTimeout(() => setShowPerm(true), 900);
       } catch {
@@ -290,7 +336,7 @@ export default function App() {
     })();
   }, []);
 
-  // ── BACK BUTTON — Capacitor + browser ───────────────────────────────────────
+  // ── BACK BUTTON ─────────────────────────────────────────────────────────────
   useEffect(() => {
     try { window.history.pushState({ p:1 }, ""); } catch {}
     const nav = () => {
@@ -313,20 +359,20 @@ export default function App() {
     };
   }, []);
 
-  // ── AUTO-SAVE (after restore only) ──────────────────────────────────────────
+  // ── AUTO-SAVE ────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!restoredRef.current) return;
-    Object.entries(bookmarks).forEach(([n, p]) => dbSaveBookmarks(n, p).catch(()=>{}));
+    Object.entries(bookmarks).forEach(([n,p]) => dbSaveBookmarks(n,p).catch(()=>{}));
   }, [bookmarks]);
   useEffect(() => {
     if (!restoredRef.current) return;
-    Object.entries(notes).forEach(([n, p]) => dbSaveNotes(n, p).catch(()=>{}));
+    Object.entries(notes).forEach(([n,p]) => dbSaveNotes(n,p).catch(()=>{}));
   }, [notes]);
-  useEffect(() => { if (restoredRef.current) dbSet("lastRead", lastRead).catch(()=>{}); }, [lastRead]);
-  useEffect(() => { if (restoredRef.current) dbSet("recentBooks", recentBooks).catch(()=>{}); }, [recentBooks]);
-  useEffect(() => { if (restoredRef.current) dbSet("dark", dark).catch(()=>{}); }, [dark]);
+  useEffect(() => { if (restoredRef.current) dbSet("lastRead",lastRead).catch(()=>{}); }, [lastRead]);
+  useEffect(() => { if (restoredRef.current) dbSet("recentBooks",recentBooks).catch(()=>{}); }, [recentBooks]);
+  useEffect(() => { if (restoredRef.current) dbSet("dark",dark).catch(()=>{}); }, [dark]);
   useEffect(() => {
-    if (currentBook) setNoteInput(notes[currentBook.name]?.[currentPage] || "");
+    if (currentBook) setNoteInput(notes[currentBook.name]?.[currentPage]||"");
   }, [currentPage, currentBook]);
 
   const toast_ = (msg, type="info") => {
@@ -341,6 +387,18 @@ export default function App() {
       if (!activePanelRef.current) setShowControls(false);
     }, 4000);
   };
+
+  // ── FIX ii: Generate and cache thumbnail for a book ──────────────────────────
+  const ensureThumb = useCallback(async (name, buf) => {
+    if (thumbs[name]) return; // already have it
+    try {
+      const dataUrl = await generateThumb(buf, name);
+      if (dataUrl) {
+        setThumbs(prev => ({ ...prev, [name]: dataUrl }));
+        dbSaveThumb(name, dataUrl).catch(()=>{});
+      }
+    } catch {}
+  }, [thumbs]);
 
   // ── STORAGE PERMISSION ───────────────────────────────────────────────────────
   const grantPermission = async () => {
@@ -366,16 +424,21 @@ export default function App() {
       if (seen.has(book.name)) return;
       seen.add(book.name); count++;
       setScanCount(count); setScanStatus(`Found: ${book.name}`);
-      try { await dbSavePDF(book.name, await book.file.arrayBuffer(), book.size, book.modified); } catch {}
+      try {
+        const buf = await book.file.arrayBuffer();
+        await dbSavePDF(book.name, buf, book.size, book.modified);
+        // FIX ii: generate thumbnail in background
+        ensureThumb(book.name, buf);
+      } catch {}
       setLibrary(prev => prev.find(b=>b.name===book.name) ? prev : [...prev, book]);
     });
     setScanning(false); setScanStatus("");
     if (!count) toast_("No new PDFs found. Select your Internal Storage root.");
-    else toast_(`Found ${count} PDF${count>1?"s":""}! Saved to library.`, "success");
+    else toast_(`Found ${count} PDF${count>1?"s":""}!`, "success");
   };
   const handleFolderInput = async (e) => {
     const files = Array.from(e.target.files||[]).filter(f=>f.name.toLowerCase().endsWith(".pdf"));
-    if (!files.length) { toast_("No PDFs found."); return; }
+    if (!files.length) { toast_("No PDFs found."); e.target.value=""; return; }
     setScanning(true); setScanCount(0);
     const seen = new Set(library.map(b=>b.name));
     let count=0;
@@ -385,27 +448,50 @@ export default function App() {
       seen.add(name); count++;
       setScanCount(count); setScanStatus(`Found: ${name}`);
       const book = { name, file:f, size:f.size, modified:f.lastModified };
-      try { await dbSavePDF(name, await f.arrayBuffer(), f.size, f.lastModified); } catch {}
+      try {
+        const buf = await f.arrayBuffer();
+        await dbSavePDF(name, buf, f.size, f.lastModified);
+        ensureThumb(name, buf); // FIX ii
+      } catch {}
       setLibrary(prev => prev.find(b=>b.name===name) ? prev : [...prev, book]);
     }
-    setScanning(false); setScanStatus(""); e.target.value="";
+    setScanning(false); setScanStatus("");
+    e.target.value = ""; // reset so same folder can be re-selected
     if (!count) toast_("No new PDFs found.");
     else toast_(`${count} PDF${count>1?"s":""} added!`, "success");
   };
-  const handleFiles = async (files) => {
-    if (!files?.length) return;
-    const books = Array.from(files).filter(f=>f.name.toLowerCase().endsWith(".pdf"))
-      .map(f=>({ name:f.name.replace(/\.pdf$/i,""), file:f, size:f.size, modified:f.lastModified }));
-    if (!books.length) return;
-    for (const b of books) {
-      try { await dbSavePDF(b.name, await b.file.arrayBuffer(), b.size, b.modified); } catch {}
+
+  // FIX vi: Reset input BEFORE triggering click (not after), so same file can be re-imported
+  const triggerFilePicker = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""; // clear FIRST
+      fileInputRef.current.click();    // THEN open picker
     }
-    setLibrary(prev => { const s=new Set(prev.map(x=>x.name)); return [...prev,...books.filter(x=>!s.has(x.name))]; });
-    toast_(`${books.length} PDF${books.length>1?"s":""} added!`, "success");
-    if (fileInputRef.current) fileInputRef.current.value="";
   };
 
-  // ── OPEN BOOK ────────────────────────────────────────────────────────────────
+  const handleFiles = async (files) => {
+    if (!files?.length) return;
+    const books = Array.from(files)
+      .filter(f => f.name.toLowerCase().endsWith(".pdf"))
+      .map(f => ({ name:f.name.replace(/\.pdf$/i,""), file:f, size:f.size, modified:f.lastModified }));
+    if (!books.length) return;
+    for (const b of books) {
+      try {
+        const buf = await b.file.arrayBuffer();
+        await dbSavePDF(b.name, buf, b.size, b.modified);
+        ensureThumb(b.name, buf); // FIX ii
+      } catch {}
+    }
+    setLibrary(prev => {
+      const s = new Set(prev.map(x=>x.name));
+      return [...prev, ...books.filter(x=>!s.has(x.name))];
+    });
+    toast_(`${books.length} PDF${books.length>1?"s":""} added!`, "success");
+  };
+
+  // ── OPEN BOOK ─────────────────────────────────────────────────────────────────
+  // FIX iv: Urdu/Arabic PDFs — added useSystemFonts, disableFontFace:false,
+  // isEvalSupported:false, verbosity:0 for maximum compatibility
   const openBook = async (book) => {
     if (!pdfjsReady) { toast_("PDF engine loading…"); return; }
     stopVoice();
@@ -416,37 +502,63 @@ export default function App() {
     const resumePage = lastRead[book.name] || 1;
     try {
       const buf = await book.file.arrayBuffer();
-      const doc = await window.pdfjsLib.getDocument({
+      const loadingTask = window.pdfjsLib.getDocument({
         data: buf,
-        cMapUrl:`https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/cmaps/`,
-        cMapPacked:true,
-        standardFontDataUrl:`https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/standard_fonts/`,
-      }).promise;
-      setCurrentPage(resumePage); setNumPages(doc.numPages); setPdfDoc(doc);
+        cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/cmaps/`,
+        cMapPacked: true,
+        standardFontDataUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/standard_fonts/`,
+        // FIX iv: these options fix Urdu/Arabic/non-Latin PDFs
+        useSystemFonts: true,
+        disableFontFace: false,
+        isEvalSupported: false,
+        verbosity: 0,
+      });
+      const doc = await loadingTask.promise;
+      setCurrentPage(resumePage);
+      setNumPages(doc.numPages);
+      // FIX iii: set pdfDoc LAST so render fires with correct page already set
+      setPdfDoc(doc);
       try { setToc(flattenOutline(await doc.getOutline())); } catch { setToc([]); }
-      setScreen("reader"); setShowControls(true);
-    } catch { toast_("Could not open this PDF.", "error"); }
+      setScreen("reader");
+      setShowControls(true);
+    } catch (err) {
+      console.error("PDF open error:", err);
+      toast_("Could not open this PDF. File may be unsupported.", "error");
+    }
   };
+
   const flattenOutline = (items, d=0) => {
     if (!items) return [];
     return items.flatMap(i=>[{title:i.title,dest:i.dest,depth:d},...flattenOutline(i.items,d+1)]);
   };
 
-  // ── RENDER PAGE (sharp + properly fitted) ────────────────────────────────────
+  // ── FIX iii: RENDER PAGE — wait for container dimensions before rendering ────
+  // Root cause of blank page 1: containerRef.clientWidth is 0 right after screen
+  // switches. Fix: measure after a rAF so DOM has laid out.
   const renderPage = useCallback(async (doc, pageNum, scaleOvr) => {
     if (!canvasRef.current || !doc) return;
     if (renderTaskRef.current) { try { renderTaskRef.current.cancel(); } catch {} }
     setRendering(true);
     try {
       const page = await doc.getPage(pageNum);
-      const ctr = containerRef.current;
-      // Fit to container width — leaves zero margin so full page shows
-      const availW = ctr ? ctr.clientWidth - 0 : window.innerWidth;
-      const fit = availW / page.getViewport({scale:1}).width;
+
+      // FIX iii: ensure container has real dimensions
+      let availW = containerRef.current?.clientWidth || 0;
+      if (availW < 10) {
+        // Wait one animation frame for DOM layout to complete
+        await new Promise(r => requestAnimationFrame(r));
+        availW = containerRef.current?.clientWidth || window.innerWidth;
+      }
+      // Still 0? Use window width as fallback
+      if (availW < 10) availW = window.innerWidth;
+
+      const naturalVP = page.getViewport({ scale: 1 });
+      const fit = availW / naturalVP.width;
       const scale = scaleOvr !== undefined ? scaleOvr : fit;
       const dpr = window.devicePixelRatio || 1;
       const vp = page.getViewport({ scale });
       const canvas = canvasRef.current;
+      if (!canvas) return;
       const ctx = canvas.getContext("2d");
       canvas.width  = Math.floor(vp.width  * dpr);
       canvas.height = Math.floor(vp.height * dpr);
@@ -455,15 +567,25 @@ export default function App() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, vp.width, vp.height);
-      const task = page.render({ canvasContext:ctx, viewport:vp, intent:"display" });
+      const task = page.render({
+        canvasContext: ctx,
+        viewport: vp,
+        intent: "display",
+      });
       renderTaskRef.current = task;
       await task.promise;
       if (scaleOvr === undefined) setZoom(fit);
-    } catch (e) { if (e?.name!=="RenderingCancelledException") console.error(e); }
-    finally { setRendering(false); }
+    } catch (e) {
+      if (e?.name !== "RenderingCancelledException") console.error("Render:", e);
+    } finally {
+      setRendering(false);
+    }
   }, []);
 
-  useEffect(() => { if (pdfDoc) renderPage(pdfDoc, currentPage, undefined); }, [pdfDoc, currentPage]);
+  useEffect(() => {
+    if (pdfDoc) renderPage(pdfDoc, currentPage, undefined);
+  }, [pdfDoc, currentPage]);
+
   const zt = useRef(null);
   useEffect(() => {
     if (!pdfDoc) return;
@@ -515,7 +637,6 @@ export default function App() {
       toast_(`Page ${currentPage} saved!`, "success");
     }
   };
-  // All bookmarks across all books
   const allBms = Object.entries(bookmarks).flatMap(([bookName,pages])=>
     pages.map(pg=>({ bookName, page:pg }))
   );
@@ -604,11 +725,7 @@ export default function App() {
   const tx      = d?C.tx:"#0f172a";
   const txM     = d?C.txM:"#64748b";
   const inputBg = d?"rgba(255,255,255,0.06)":"rgba(0,0,0,0.04)";
-  const acc     = C.neon;
-  const accG    = C.borderG;
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // RENDER
   // ════════════════════════════════════════════════════════════════════════════
   return (
     <div style={{ height:"100vh", background:bg, color:tx,
@@ -623,14 +740,15 @@ export default function App() {
           background:"radial-gradient(circle,rgba(124,58,237,0.08) 0%,transparent 70%)", borderRadius:"50%" }} />
       </div>
 
-      {/* Hidden file inputs */}
+      {/* FIX vi: value cleared BEFORE click via triggerFilePicker() */}
       <input ref={fileInputRef} type="file" accept=".pdf,application/pdf"
-        multiple style={{ display:"none" }} onChange={e=>handleFiles(e.target.files)} />
+        multiple style={{ display:"none" }}
+        onChange={e=>handleFiles(e.target.files)} />
       <input ref={folderInputRef} type="file" accept=".pdf"
         multiple webkitdirectory="" mozdirectory=""
         style={{ display:"none" }} onChange={handleFolderInput} />
 
-      {/* ── SCANNING OVERLAY ── */}
+      {/* Scanning overlay */}
       {scanning && (
         <div style={{ position:"fixed", inset:0, zIndex:290,
           background:"rgba(0,0,0,0.93)", backdropFilter:"blur(16px)",
@@ -655,7 +773,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── PERMISSION POPUP ── */}
+      {/* Permission popup */}
       {showPerm && (
         <div style={{ position:"fixed", inset:0, zIndex:300,
           background:"rgba(0,0,0,0.90)", backdropFilter:"blur(16px)",
@@ -687,7 +805,7 @@ export default function App() {
             <GlowBtn label="📂 Scan All PDFs" onClick={grantPermission} full />
             <div style={{ height:10 }} />
             <GlowBtn label="Pick Files Manually" full outline
-              onClick={()=>{ setShowPerm(false); skipPerm(); fileInputRef.current?.click(); }} />
+              onClick={()=>{ setShowPerm(false); skipPerm(); triggerFilePicker(); }} />
             <button onClick={skipPerm} style={{ background:"none", border:"none", width:"100%",
               color:C.txM, fontSize:12, cursor:"pointer", padding:"12px", fontFamily:"inherit" }}>
               Don't ask again
@@ -696,12 +814,14 @@ export default function App() {
         </div>
       )}
 
-      {/* ── DRAWER ── */}
+      {/* Drawer backdrop */}
       {drawerOpen && (
         <div style={{ position:"fixed", inset:0, zIndex:80,
           background:"rgba(0,0,0,0.6)", backdropFilter:"blur(4px)" }}
           onClick={()=>{ setDrawerOpen(false); setDrawerView("menu"); }} />
       )}
+
+      {/* Drawer */}
       <div style={{ position:"fixed", top:0, left:0, bottom:0, width:300, zIndex:90,
         background:d?"linear-gradient(180deg,#070d1a,#0c1428)":"#ffffff",
         borderRight:`1px solid ${border_}`,
@@ -709,8 +829,6 @@ export default function App() {
         transition:"transform .28s cubic-bezier(.4,0,.2,1)",
         backdropFilter:"blur(20px)", display:"flex", flexDirection:"column",
         boxShadow:drawerOpen?`6px 0 60px rgba(37,99,235,0.15)`:"none" }}>
-
-        {/* Drawer header */}
         <div style={{ padding:"22px 20px 16px", borderBottom:`1px solid ${border_}`,
           display:"flex", alignItems:"center", justifyContent:"space-between" }}>
           <div>
@@ -727,57 +845,51 @@ export default function App() {
             style={{ background:"none", border:"none", color:txM, fontSize:22, cursor:"pointer" }}>×</button>
         </div>
 
-        {/* Drawer content */}
         <div style={{ flex:1, overflowY:"auto", padding:"12px 8px" }}>
-
           {drawerView==="menu" ? (
             <>
-              {/* Library section */}
               <DrawerSection label="Library" />
               <DrawerRow icon="🏠" label="My Library" sub={`${library.length} books`}
-                tx={tx} txM={txM} accL={C.borderG}
+                tx={tx} txM={txM}
                 onClick={()=>{ setScreen("home"); setPdfDoc(null); stopVoice(); setDrawerOpen(false); }} />
               <DrawerRow icon="➕" label="Add PDF" sub="Pick from device"
-                tx={tx} txM={txM} accL={C.borderG}
-                onClick={()=>{ setDrawerOpen(false); fileInputRef.current?.click(); }} />
+                tx={tx} txM={txM}
+                onClick={()=>{ setDrawerOpen(false); triggerFilePicker(); }} />
               <DrawerRow icon="📂" label="Scan Storage" sub="Find all PDFs automatically"
-                tx={tx} txM={txM} accL={C.borderG}
+                tx={tx} txM={txM}
                 onClick={async()=>{ setDrawerOpen(false); await grantPermission(); }} />
 
-              {/* Saved pages across ALL books */}
               <div style={{ height:1, background:border_, margin:"10px 12px" }} />
               <DrawerSection label="Bookmarks" />
               <DrawerRow icon="🔖" label="All Saved Pages"
-                sub={`${allBms.length} saved across ${Object.keys(bookmarks).filter(k=>(bookmarks[k]||[]).length>0).length} books`}
-                tx={tx} txM={txM} accL={C.borderG}
+                sub={`${allBms.length} saved across all books`}
+                tx={tx} txM={txM}
                 onClick={()=>setDrawerView("allsaved")} />
 
-              {/* Current book options */}
               {screen==="reader" && (
                 <>
                   <div style={{ height:1, background:border_, margin:"10px 12px" }} />
                   <DrawerSection label="Current Book" />
-                  <DrawerRow icon="🔍" label="Search PDF" sub="Full text search with highlights"
-                    tx={tx} txM={txM} accL={C.borderG}
+                  <DrawerRow icon="🔍" label="Search PDF" sub="Full text search"
+                    tx={tx} txM={txM}
                     onClick={()=>{ setActivePanel("search"); setDrawerOpen(false); }} />
                   <DrawerRow icon="✏️" label="Notes" sub={`${Object.keys(bNotes).length} notes`}
-                    tx={tx} txM={txM} accL={C.borderG}
+                    tx={tx} txM={txM}
                     onClick={()=>{ setActivePanel("notes"); setDrawerOpen(false); }} />
                   <DrawerRow icon="📑" label="Contents" sub={toc.length>0?`${toc.length} sections`:"Not available"}
-                    tx={tx} txM={txM} accL={C.borderG}
+                    tx={tx} txM={txM}
                     onClick={()=>{ setActivePanel("toc"); setDrawerOpen(false); }} />
                 </>
               )}
 
-              {/* Settings */}
               <div style={{ height:1, background:border_, margin:"10px 12px" }} />
               <DrawerSection label="Settings" />
               <DrawerRow icon={d?"☀️":"🌙"} label={d?"Light Mode":"Dark Mode"}
-                sub="Switch appearance" tx={tx} txM={txM} accL={C.borderG}
+                sub="Switch appearance" tx={tx} txM={txM}
                 onClick={()=>setDark(!d)} />
             </>
           ) : (
-            /* ALL SAVED PAGES VIEW */
+            /* ALL SAVED PAGES */
             <>
               <div style={{ padding:"10px 12px", display:"flex", alignItems:"center", gap:10 }}>
                 <button onClick={()=>setDrawerView("menu")}
@@ -794,23 +906,24 @@ export default function App() {
               ) : allBms.map((item,i)=>(
                 <div key={i} onClick={async()=>{
                   const book=library.find(b=>b.name===item.bookName);
-                  if (book) { await openBook(book); setTimeout(()=>goToPage(item.page),600); }
+                  if (book) { await openBook(book); setTimeout(()=>goToPage(item.page),800); }
                   setDrawerOpen(false); setDrawerView("menu");
                 }} style={{ padding:"12px 14px", borderRadius:12, marginBottom:6,
-                  cursor:"pointer", transition:"background .15s",
-                  border:`1px solid ${border_}`, background:inputBg }}
+                  cursor:"pointer", border:`1px solid ${border_}`, background:inputBg,
+                  transition:"border-color .15s" }}
                   onMouseEnter={e=>e.currentTarget.style.borderColor=C.borderG}
                   onMouseLeave={e=>e.currentTarget.style.borderColor=border_}>
                   <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                    <div style={{ width:36, height:36, borderRadius:10,
-                      background:`linear-gradient(135deg,hsl(${coverHue(item.bookName)},50%,30%),hsl(${coverHue(item.bookName)+30},40%,18%))`,
+                    <div style={{ width:36, height:36, borderRadius:10, overflow:"hidden",
+                      background:`linear-gradient(135deg,hsl(${coverHue(item.bookName)},50%,28%),hsl(${coverHue(item.bookName)+30},40%,16%))`,
                       display:"flex", alignItems:"center", justifyContent:"center",
-                      fontSize:16, flexShrink:0 }}>📄</div>
+                      fontSize:16, flexShrink:0 }}>
+                      {thumbs[item.bookName]
+                        ? <img src={thumbs[item.bookName]} alt="" style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+                        : "📄"}
+                    </div>
                     <div style={{ flex:1, overflow:"hidden" }}>
-                      <div style={{ fontSize:13, fontWeight:700, color:C.neonL,
-                        overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                        Page {item.page}
-                      </div>
+                      <div style={{ fontSize:13, fontWeight:700, color:C.neonL }}>Page {item.page}</div>
                       <div style={{ fontSize:11, color:txM, marginTop:2,
                         overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
                         {item.bookName}
@@ -824,7 +937,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Reading progress */}
         {screen==="reader" && pdfDoc && (
           <div style={{ padding:"14px 18px", borderTop:`1px solid ${border_}` }}>
             <div style={{ display:"flex", justifyContent:"space-between",
@@ -845,37 +957,27 @@ export default function App() {
         )}
       </div>
 
-      {/* ════════════════════════════════════════════════════════════════════════
-          HOME SCREEN — matches sketch exactly
-      ════════════════════════════════════════════════════════════════════════ */}
+      {/* ════ HOME SCREEN ════ */}
       {screen==="home" && (
         <div style={{ flex:1, display:"flex", flexDirection:"column",
           overflow:"hidden", position:"relative", zIndex:1 }}>
 
-          {/* ── TOP BAR ── */}
           <div style={{ flexShrink:0, padding:"16px 18px 0",
             display:"flex", alignItems:"center", justifyContent:"space-between" }}>
             <button onClick={()=>{ setDrawerOpen(true); setDrawerView("menu"); }}
               style={{ background:inputBg, border:`1px solid ${border_}`,
                 borderRadius:12, width:40, height:40, cursor:"pointer", color:tx,
-                fontSize:18, display:"flex", alignItems:"center", justifyContent:"center",
-                flexShrink:0 }}>☰</button>
-
-            {/* Greeting */}
+                fontSize:18, display:"flex", alignItems:"center", justifyContent:"center" }}>☰</button>
             <div style={{ flex:1, paddingLeft:12 }}>
               <div style={{ fontSize:13, color:txM }}>{getGreeting()}</div>
             </div>
-
-            {/* Theme toggle */}
             <button onClick={()=>setDark(!d)}
-              style={{ background:"none", border:"none", fontSize:20,
-                cursor:"pointer", color:acc }}>
+              style={{ background:"none", border:"none", fontSize:20, cursor:"pointer", color:C.neon }}>
               {d?"☀️":"🌙"}
             </button>
           </div>
 
-          {/* ── LIBRARY TITLE ── */}
-          <div style={{ padding:"12px 18px 0" }}>
+          <div style={{ padding:"10px 18px 0" }}>
             <div style={{ fontSize:26, fontWeight:800,
               background:`linear-gradient(135deg,${d?"#fff":C.bg0},${C.neonL})`,
               WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>
@@ -886,8 +988,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* ── SEARCH BAR ── */}
-          <div style={{ padding:"14px 18px 0" }}>
+          <div style={{ padding:"12px 18px 0" }}>
             <div style={{ position:"relative" }}>
               <span style={{ position:"absolute", left:14, top:"50%",
                 transform:"translateY(-50%)", fontSize:15, color:txM }}>🔍</span>
@@ -897,8 +998,7 @@ export default function App() {
                   borderRadius:14, border:`1.5px solid ${border_}`,
                   background:inputBg, backdropFilter:"blur(10px)",
                   color:tx, fontSize:14, fontFamily:"inherit",
-                  outline:"none", boxSizing:"border-box",
-                  transition:"border-color .2s" }}
+                  outline:"none", boxSizing:"border-box", transition:"border-color .2s" }}
                 onFocus={e=>e.target.style.borderColor=C.neon}
                 onBlur={e=>e.target.style.borderColor=border_} />
               {libSearch && (
@@ -910,11 +1010,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* ── SCROLLABLE CONTENT ── */}
-          <div style={{ flex:1, overflowY:"auto", padding:"0 18px 120px" }}>
-
+          <div style={{ flex:1, overflowY:"auto", padding:"0 18px 110px" }}>
             {library.length===0 ? (
-              /* Empty state */
               <div style={{ display:"flex", flexDirection:"column", alignItems:"center",
                 justifyContent:"center", minHeight:"55vh", gap:16, textAlign:"center" }}>
                 <div style={{ fontSize:72, filter:`drop-shadow(0 0 20px rgba(37,99,235,0.4))` }}>📚</div>
@@ -927,25 +1024,28 @@ export default function App() {
               <>
                 {/* RECENTLY OPENED */}
                 {recentList.length>0 && !libSearch && (
-                  <div style={{ marginTop:20 }}>
+                  <div style={{ marginTop:18 }}>
                     <SectionLabel label="Recently Opened" color={txM} />
                     <div style={{ display:"flex", gap:12, overflowX:"auto",
                       paddingBottom:4, scrollbarWidth:"none" }}>
                       {recentList.slice(0,3).map((book,i)=>(
-                        <SmallBookCard key={i} book={book}
+                        <BookCard key={i} book={book}
                           hue={coverHue(book.name)}
+                          thumb={thumbs[book.name]}
                           lastPage={lastRead[book.name]}
                           bms={(bookmarks[book.name]||[]).length}
                           onOpen={()=>openBook(book)}
-                          onRemove={()=>setRecentBooks(prev=>prev.filter(n=>n!==book.name))}
-                          d={d} />
+                          onAction={()=>setRecentBooks(prev=>prev.filter(n=>n!==book.name))}
+                          actionLabel="×"
+                          width={108} height={148}
+                          d={d} txM={txM} />
                       ))}
                     </div>
                   </div>
                 )}
 
-                {/* ALL BOOKS */}
-                <div style={{ marginTop:recentList.length&&!libSearch?20:20 }}>
+                {/* ALL BOOKS — FIX i: same proportions as recently opened */}
+                <div style={{ marginTop:20 }}>
                   <SectionLabel
                     label={libSearch?`Results (${filtLib.length})`:`All Books (${library.length})`}
                     color={txM} />
@@ -954,21 +1054,26 @@ export default function App() {
                       No books match "<span style={{color:C.neonL}}>{libSearch}</span>"
                     </div>
                   ) : (
+                    /* FIX i: 3 equal columns, same card height as recently opened */
                     <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
                       {filtLib.map((book,i)=>(
-                        <BigBookCard key={i} book={book}
+                        <BookCard key={i} book={book}
                           hue={coverHue(book.name)}
+                          thumb={thumbs[book.name]}
                           lastPage={lastRead[book.name]}
                           bms={(bookmarks[book.name]||[]).length}
                           onOpen={()=>openBook(book)}
-                          onDelete={()=>{
+                          onAction={()=>{
                             if (window.confirm(`Remove "${book.name}"?`)) {
                               dbDeletePDF(book.name).catch(()=>{});
                               setLibrary(prev=>prev.filter(b=>b.name!==book.name));
                               setRecentBooks(prev=>prev.filter(n=>n!==book.name));
                               toast_("Removed from library");
                             }
-                          }} />
+                          }}
+                          actionLabel="×"
+                          gridMode={true}
+                          d={d} txM={txM} />
                       ))}
                     </div>
                   )}
@@ -977,40 +1082,35 @@ export default function App() {
             )}
           </div>
 
-          {/* ── FLOATING + BUTTON with weighted/bending effect ── */}
+          {/* FIX v: Smaller + button (52px instead of 64px) */}
           <div style={{ position:"fixed", bottom:0, left:0, right:0,
             display:"flex", justifyContent:"center", alignItems:"flex-end",
             pointerEvents:"none", zIndex:20 }}>
-
-            {/* Weighted platform — bends visually toward the button */}
             <div style={{ position:"relative", pointerEvents:"auto" }}>
-              {/* Shadow/weight indicator below button */}
-              <div style={{ position:"absolute", bottom:-4, left:"50%",
+              <div style={{ position:"absolute", bottom:-2, left:"50%",
                 transform:"translateX(-50%)",
-                width:plusPressed?50:70, height:plusPressed?6:10,
-                background:`radial-gradient(ellipse,rgba(37,99,235,${plusPressed?0.2:0.4}) 0%,transparent 70%)`,
+                width:plusPressed?42:58, height:plusPressed?5:8,
+                background:`radial-gradient(ellipse,rgba(37,99,235,${plusPressed?0.2:0.35}) 0%,transparent 70%)`,
                 borderRadius:"50%", transition:"all .15s" }} />
-
-              {/* The + button */}
               <button
                 onMouseDown={()=>setPlusPressed(true)}
                 onMouseUp={()=>setPlusPressed(false)}
                 onTouchStart={()=>setPlusPressed(true)}
-                onTouchEnd={()=>{ setPlusPressed(false); fileInputRef.current?.click(); }}
-                onClick={()=>fileInputRef.current?.click()}
-                style={{ marginBottom:24,
-                  width:plusPressed?58:64, height:plusPressed?58:64,
+                onTouchEnd={()=>{ setPlusPressed(false); triggerFilePicker(); }}
+                onClick={()=>triggerFilePicker()}
+                style={{ marginBottom:22,
+                  width:plusPressed?46:52, height:plusPressed?46:52, // FIX v: smaller
                   borderRadius:"50%",
                   background:plusPressed
-                    ?`linear-gradient(135deg,${C.glowS||"#1d4ed8"},${C.purple})`
+                    ?`linear-gradient(135deg,#1d4ed8,${C.purple})`
                     :`linear-gradient(135deg,${C.glow},${C.purple})`,
                   border:"none", cursor:"pointer",
-                  fontSize:plusPressed?28:32, color:"#fff",
+                  fontSize:plusPressed?24:26, color:"#fff",
                   display:"flex", alignItems:"center", justifyContent:"center",
                   boxShadow:plusPressed
-                    ?`0 2px 12px rgba(37,99,235,0.6), 0 0 0 8px rgba(37,99,235,0.08)`
-                    :`0 8px 32px rgba(37,99,235,0.6), 0 0 0 12px rgba(37,99,235,0.10)`,
-                  transform:plusPressed?"translateY(4px) scale(0.92)":"translateY(0) scale(1)",
+                    ?`0 2px 10px rgba(37,99,235,0.6), 0 0 0 6px rgba(37,99,235,0.08)`
+                    :`0 6px 24px rgba(37,99,235,0.6), 0 0 0 10px rgba(37,99,235,0.10)`,
+                  transform:plusPressed?"translateY(3px) scale(0.93)":"translateY(0) scale(1)",
                   transition:"all .15s cubic-bezier(.34,1.56,.64,1)",
                   lineHeight:1 }}>
                 +
@@ -1020,14 +1120,12 @@ export default function App() {
         </div>
       )}
 
-      {/* ════════════════════════════════════════════════════════════════════════
-          READER SCREEN — matches sketch exactly
-      ════════════════════════════════════════════════════════════════════════ */}
+      {/* ════ READER SCREEN ════ */}
       {screen==="reader" && (
         <div style={{ flex:1, display:"flex", flexDirection:"column",
           overflow:"hidden", position:"relative", zIndex:1 }}>
 
-          {/* ── TOP BAR (in flow — never overlaps PDF) ── */}
+          {/* Top bar — in flow */}
           <div style={{ flexShrink:0,
             background:d?"rgba(7,13,26,0.97)":"rgba(255,255,255,0.97)",
             borderBottom:`1px solid ${border_}`,
@@ -1053,7 +1151,7 @@ export default function App() {
               style={glassBtn()}>+</button>
           </div>
 
-          {/* ── PDF CANVAS — fills all remaining space ── */}
+          {/* PDF canvas area */}
           <div ref={containerRef}
             onTouchStart={onTS} onTouchMove={onTM} onTouchEnd={onTE}
             onClick={()=>{ touchControls(); if(activePanelRef.current) setActivePanel(null); }}
@@ -1061,7 +1159,6 @@ export default function App() {
               display:"flex", flexDirection:"column", alignItems:"center",
               background:d?"linear-gradient(180deg,#0f0f1a,#141428)":"#e8edf5",
               WebkitOverflowScrolling:"touch",
-              // Small vertical padding so shadow shows nicely
               paddingTop:8, paddingBottom:8 }}>
 
             {rendering && (
@@ -1074,15 +1171,13 @@ export default function App() {
               </div>
             )}
 
-            {/* Canvas — width:100% ensures full-width rendering */}
             <div style={{ width:"100%",
               boxShadow:d
-                ?"0 0 40px rgba(37,99,235,0.12), 0 8px 40px rgba(0,0,0,0.7)"
+                ?"0 0 40px rgba(37,99,235,0.12),0 8px 40px rgba(0,0,0,0.7)"
                 :"0 4px 24px rgba(0,0,0,0.15)" }}>
               <canvas ref={canvasRef} style={{ display:"block", width:"100%" }} />
             </div>
 
-            {/* Note display below PDF */}
             {bNotes[currentPage] && (
               <div dir="auto" style={{ margin:"12px 12px 0", width:"calc(100% - 24px)",
                 background:C.glass, backdropFilter:"blur(12px)",
@@ -1094,53 +1189,48 @@ export default function App() {
             )}
           </div>
 
-          {/* ── BOTTOM CONTROLS — matches sketch ── */}
+          {/* Bottom controls */}
           <div style={{ flexShrink:0,
             background:d?"rgba(7,13,26,0.97)":"rgba(255,255,255,0.97)",
             borderTop:`1px solid ${border_}`,
             opacity:showControls?1:0, transition:"opacity .3s",
             pointerEvents:showControls?"auto":"none" }}>
 
-            {/* Row 1: Prev / Page indicator / Next */}
+            {/* Prev / page / next */}
             <div style={{ display:"flex", alignItems:"center",
-              justifyContent:"space-between", padding:"10px 16px 6px", gap:8 }}>
+              justifyContent:"space-between", padding:"10px 14px 6px", gap:6 }}>
               <button onClick={()=>goToPage(1)} disabled={currentPage===1}
-                style={{ ...glassBtn({width:36,height:36,fontSize:13}),
-                  opacity:currentPage===1?.3:1 }}>⏮</button>
+                style={{ ...glassBtn({width:34,height:34,fontSize:12}), opacity:currentPage===1?.3:1 }}>⏮</button>
               <button onClick={()=>goToPage(currentPage-1)} disabled={currentPage===1}
-                style={{ ...glassBtn({padding:"0 14px",width:"auto",height:36,fontSize:12,borderRadius:20}),
+                style={{ ...glassBtn({padding:"0 12px",width:"auto",height:34,fontSize:11,borderRadius:20}),
                   opacity:currentPage===1?.3:1 }}>◀ Prev</button>
-
-              {/* Page pill with progress */}
               <div style={{ flex:1, textAlign:"center" }}>
-                <div style={{ fontSize:14, fontWeight:800, color:C.neonL }}>
+                <div style={{ fontSize:13, fontWeight:800, color:C.neonL }}>
                   {currentPage} / {numPages}
                 </div>
                 <div style={{ height:3, background:d?C.bg3:"#e2e8f0",
-                  borderRadius:3, marginTop:4 }}>
+                  borderRadius:3, marginTop:3 }}>
                   <div style={{ height:"100%", borderRadius:3,
                     background:`linear-gradient(90deg,${C.neon},${C.purple})`,
                     width:`${(currentPage/numPages)*100}%`, transition:"width .3s",
                     boxShadow:`0 0 6px ${C.neon}` }} />
                 </div>
               </div>
-
               <button onClick={()=>goToPage(currentPage+1)} disabled={currentPage===numPages}
-                style={{ ...glassBtn({padding:"0 14px",width:"auto",height:36,fontSize:12,borderRadius:20}),
+                style={{ ...glassBtn({padding:"0 12px",width:"auto",height:34,fontSize:11,borderRadius:20}),
                   opacity:currentPage===numPages?.3:1 }}>Next ▶</button>
               <button onClick={()=>goToPage(numPages)} disabled={currentPage===numPages}
-                style={{ ...glassBtn({width:36,height:36,fontSize:13}),
-                  opacity:currentPage===numPages?.3:1 }}>⏭</button>
+                style={{ ...glassBtn({width:34,height:34,fontSize:12}), opacity:currentPage===numPages?.3:1 }}>⏭</button>
             </div>
 
-            {/* Row 2: 5 icon buttons exactly like sketch */}
+            {/* 5 icon buttons */}
             <div style={{ display:"flex", borderTop:`1px solid ${border_}` }}>
               {[
-                { icon:"🔍", key:"search",   tip:"Search"   },
-                { icon:"🔖", key:"saved",    tip:"Saved"    },
-                { icon:"🎧", key:"voice",    tip:"Listen"   },
-                { icon:"✏️",  key:"notes",    tip:"Notes"    },
-                { icon:"🔢", key:"goto",     tip:"Go to"    },
+                { icon:"🔍", key:"search", tip:"Search" },
+                { icon:"🔖", key:"saved",  tip:"Saved"  },
+                { icon:"🎧", key:"voice",  tip:"Listen" },
+                { icon:"✏️",  key:"notes",  tip:"Notes"  },
+                { icon:"🔢", key:"goto",   tip:"Go to"  },
               ].map(item=>(
                 <button key={item.key}
                   onClick={()=>{
@@ -1148,12 +1238,10 @@ export default function App() {
                     setActivePanel(activePanel===item.key?null:item.key);
                   }}
                   style={{ flex:1, background:"transparent", border:"none",
-                    cursor:"pointer", padding:"10px 2px 12px",
-                    borderTop:activePanel===item.key||
-                      (item.key==="saved"&&isBm)
+                    cursor:"pointer", padding:"9px 2px 11px",
+                    borderTop:activePanel===item.key||(item.key==="saved"&&isBm)
                       ?`2px solid ${C.neon}`:"2px solid transparent",
-                    color:activePanel===item.key||(item.key==="saved"&&isBm)
-                      ?C.neonL:txM,
+                    color:activePanel===item.key||(item.key==="saved"&&isBm)?C.neonL:txM,
                     fontFamily:"inherit", transition:"all .15s" }}>
                   <div style={{ fontSize:item.key==="saved"&&isBm?22:20,
                     filter:activePanel===item.key||(item.key==="saved"&&isBm)
@@ -1167,7 +1255,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* ── PANELS (slide up) ── */}
+          {/* Panels */}
           {activePanel && (
             <div style={{ position:"fixed", bottom:0, left:0, right:0,
               background:d
@@ -1180,17 +1268,14 @@ export default function App() {
               maxHeight:"65vh", overflowY:"auto",
               zIndex:30, animation:"slideUp .3s cubic-bezier(.4,0,.2,1)",
               boxShadow:`0 -16px 60px rgba(37,99,235,0.14)` }}>
-
-              {/* Handle */}
               <div style={{ display:"flex", justifyContent:"center", padding:"12px 0 6px" }}>
                 <div style={{ width:36, height:4, borderRadius:4, cursor:"pointer",
                   background:`linear-gradient(90deg,${C.neon},${C.purple})` }}
                   onClick={()=>setActivePanel(null)} />
               </div>
-
               <div style={{ padding:"4px 20px 100px" }}>
 
-                {/* SEARCH PANEL */}
+                {/* SEARCH */}
                 {activePanel==="search" && (
                   <>
                     <PanelTitle title="🔍 Search PDF" tx={tx} />
@@ -1215,8 +1300,7 @@ export default function App() {
                       <button onClick={runSearch}
                         style={{ background:`linear-gradient(135deg,${C.glow},${C.purple})`,
                           border:"none",borderRadius:14,padding:"0 20px",
-                          color:"#fff",fontWeight:700,cursor:"pointer",fontSize:14,
-                          boxShadow:`0 4px 20px rgba(37,99,235,0.4)` }}>Go</button>
+                          color:"#fff",fontWeight:700,cursor:"pointer",fontSize:14 }}>Go</button>
                     </div>
                     {searchRes.length>0&&(
                       <div style={{ display:"flex",alignItems:"center",
@@ -1270,7 +1354,7 @@ export default function App() {
                   </>
                 )}
 
-                {/* SAVED PAGES PANEL */}
+                {/* GO TO PAGE */}
                 {activePanel==="goto" && (
                   <>
                     <PanelTitle title="🔢 Go to Page" tx={tx} />
@@ -1285,8 +1369,7 @@ export default function App() {
                       <button onClick={()=>{goToPage(parseInt(goInput));setGoInput("");setActivePanel(null);}}
                         style={{ background:`linear-gradient(135deg,${C.glow},${C.purple})`,
                           border:"none",borderRadius:14,padding:"0 22px",
-                          color:"#fff",fontWeight:700,cursor:"pointer",fontSize:14,
-                          boxShadow:`0 4px 20px rgba(37,99,235,0.4)` }}>Go</button>
+                          color:"#fff",fontWeight:700,cursor:"pointer",fontSize:14 }}>Go</button>
                     </div>
                     <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>
                       {[1,Math.floor(numPages*.25),Math.floor(numPages*.5),Math.floor(numPages*.75),numPages]
@@ -1294,11 +1377,10 @@ export default function App() {
                         .map(pg=>(
                           <button key={pg} onClick={()=>{goToPage(pg);setActivePanel(null);}}
                             style={{ background:pg===currentPage
-                              ?`linear-gradient(135deg,${C.glow},${C.purple})`
-                              :inputBg,
+                              ?`linear-gradient(135deg,${C.glow},${C.purple})`:inputBg,
                               border:`1px solid ${pg===currentPage?C.neon:border_}`,
                               color:pg===currentPage?"#fff":tx,
-                              padding:"9px 16px",borderRadius:12,fontSize:12,
+                              padding:"9px 14px",borderRadius:12,fontSize:12,
                               cursor:"pointer",fontFamily:"inherit",fontWeight:600 }}>
                             {pg===1?"First":pg===numPages?"Last":`Page ${pg}`}
                           </button>
@@ -1307,13 +1389,11 @@ export default function App() {
                   </>
                 )}
 
-                {/* VOICE PANEL */}
+                {/* VOICE */}
                 {activePanel==="voice" && (
                   <>
                     <PanelTitle title="🎧 Voice Reader" tx={tx} />
-                    <div style={{ fontSize:12,color:txM,marginBottom:16 }}>
-                      Page {currentPage} — tap play to listen
-                    </div>
+                    <div style={{ fontSize:12,color:txM,marginBottom:16 }}>Page {currentPage}</div>
                     <div style={{ display:"flex",alignItems:"center",
                       justifyContent:"center",gap:3,margin:"16px 0",height:56 }}>
                       {Array.from({length:22}).map((_,i)=>(
@@ -1321,7 +1401,6 @@ export default function App() {
                           background:voicePlaying
                             ?`linear-gradient(180deg,${C.neon},${C.purple})`
                             :"rgba(59,130,246,0.2)",
-                          boxShadow:voicePlaying?`0 0 8px ${C.neon}`:"none",
                           height:voicePlaying?`${28+Math.abs(Math.sin(i*.5))*72}%`:"20%",
                           animation:voicePlaying?`wave .7s ease ${i*.04}s infinite alternate`:"none",
                           transition:"height .2s" }} />
@@ -1341,10 +1420,7 @@ export default function App() {
                           background:`linear-gradient(135deg,${C.glow},${C.purple})`,
                           border:"none",cursor:"pointer",fontSize:26,color:"#fff",
                           boxShadow:`0 0 40px rgba(37,99,235,0.5)`,
-                          display:"flex",alignItems:"center",justifyContent:"center",
-                          transition:"transform .15s" }}
-                        onMouseEnter={e=>e.currentTarget.style.transform="scale(1.08)"}
-                        onMouseLeave={e=>e.currentTarget.style.transform="scale(1)"}>
+                          display:"flex",alignItems:"center",justifyContent:"center" }}>
                         {voicePlaying?"⏸":"▶"}
                       </button>
                       <button onClick={()=>{stopVoice();goToPage(currentPage+1);}}
@@ -1355,8 +1431,7 @@ export default function App() {
                       <div style={{ fontSize:12,color:txM,marginBottom:10 }}>
                         Speed: <span style={{color:C.neonL,fontWeight:700}}>{voiceSpeed}x</span>
                       </div>
-                      <input type="range" min="0.5" max="2" step="0.25"
-                        value={voiceSpeed}
+                      <input type="range" min="0.5" max="2" step="0.25" value={voiceSpeed}
                         onChange={e=>{
                           setVoiceSpeed(parseFloat(e.target.value));
                           if (voicePlaying){stopVoice();setTimeout(startVoice,100);}
@@ -1370,7 +1445,7 @@ export default function App() {
                   </>
                 )}
 
-                {/* NOTES PANEL */}
+                {/* NOTES */}
                 {activePanel==="notes" && (
                   <>
                     <PanelTitle title={`✏️ Note — Page ${currentPage}`} tx={tx} />
@@ -1413,7 +1488,7 @@ export default function App() {
                   </>
                 )}
 
-                {/* TABLE OF CONTENTS */}
+                {/* TOC */}
                 {activePanel==="toc" && (
                   <>
                     <PanelTitle title="📑 Contents" tx={tx} />
@@ -1423,8 +1498,7 @@ export default function App() {
                       </div>
                       :toc.map((item,i)=>(
                         <div key={i} dir="auto" onClick={()=>navToc(item)}
-                          style={{ padding:"10px 12px",
-                            paddingLeft:12+item.depth*18,
+                          style={{ padding:"10px 12px",paddingLeft:12+item.depth*18,
                             borderRadius:10,cursor:"pointer",marginBottom:4,
                             fontSize:item.depth===0?14:12,
                             fontWeight:item.depth===0?700:400,
@@ -1444,20 +1518,20 @@ export default function App() {
         </div>
       )}
 
-      {/* ── TOAST ── */}
+      {/* Toast */}
       {toast && (
-        <div style={{ position:"fixed", bottom:100, left:"50%",
+        <div style={{ position:"fixed", bottom:90, left:"50%",
           transform:"translateX(-50%)",
           background:toast.type==="success"
             ?`linear-gradient(135deg,${C.glow},${C.purple})`
             :d?"rgba(12,20,40,0.95)":"rgba(255,255,255,0.95)",
-          backdropFilter:"blur(12px)", color:tx,
+          backdropFilter:"blur(12px)",
+          color:toast.type==="success"?"#fff":tx,
           padding:"10px 22px", borderRadius:24, fontSize:13,
           boxShadow:`0 4px 28px rgba(37,99,235,0.35)`,
           border:`1px solid ${C.borderG}`,
           zIndex:500, whiteSpace:"nowrap",
-          animation:"fadeUp .2s ease", fontWeight:600,
-          color:toast.type==="success"?"#fff":tx }}>
+          animation:"fadeUp .2s ease", fontWeight:600 }}>
           {toast.msg}
         </div>
       )}
@@ -1476,13 +1550,99 @@ export default function App() {
         *{box-sizing:border-box}
         input:focus,textarea:focus{outline:none}
         input[type=range]{-webkit-appearance:none;height:4px;border-radius:4px;background:rgba(59,130,246,0.15)}
-        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#7c3aed);cursor:pointer;box-shadow:0 0 10px rgba(37,99,235,0.5)}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#7c3aed);cursor:pointer}
       `}</style>
     </div>
   );
 }
 
-// ── Reusable components ───────────────────────────────────────────────────────
+// ── Shared BookCard — FIX i: SINGLE component used for BOTH recently opened
+// and all books sections so proportions are always identical ──────────────────
+function BookCard({ book, hue, thumb, lastPage, bms, onOpen, onAction, actionLabel, gridMode, d, txM }) {
+  // In grid mode: fill column width. In row mode: fixed width
+  const cardStyle = gridMode
+    ? { width:"100%", position:"relative", animation:"fadeIn .3s ease both" }
+    : { flexShrink:0, width:108, position:"relative", cursor:"pointer" };
+
+  return (
+    <div style={cardStyle} onClick={gridMode ? onOpen : onOpen}>
+      {/* Cover */}
+      <div style={{
+        // FIX i: same height in both modes — use aspectRatio so grid cards match
+        aspectRatio: gridMode ? "2/3" : undefined,
+        height: gridMode ? undefined : 148,
+        borderRadius:14, overflow:"hidden",
+        background:`linear-gradient(160deg,hsl(${hue},58%,26%),hsl(${hue+30},48%,15%))`,
+        border:`1px solid hsl(${hue},38%,32%)`,
+        boxShadow:`0 0 16px hsla(${hue},55%,35%,.20),0 6px 24px rgba(0,0,0,.5)`,
+        display:"flex", flexDirection:"column", alignItems:"center",
+        justifyContent:"center", position:"relative",
+        marginBottom:6, transition:"transform .2s, box-shadow .2s",
+        cursor:"pointer",
+      }}
+        onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-3px)";e.currentTarget.style.boxShadow=`0 0 24px hsla(${hue},55%,35%,.36),0 12px 30px rgba(0,0,0,.6)`;}}
+        onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=`0 0 16px hsla(${hue},55%,35%,.20),0 6px 24px rgba(0,0,0,.5)`;}} >
+
+        {/* FIX ii: show thumbnail if available, else icon + name */}
+        {thumb ? (
+          <img src={thumb} alt={book.name}
+            style={{ width:"100%", height:"100%", objectFit:"cover",
+              display:"block", borderRadius:14 }} />
+        ) : (
+          <>
+            <div style={{ fontSize:gridMode?20:22, marginBottom:6 }}>📄</div>
+            <div dir="auto" style={{ fontSize:gridMode?8:9, color:`hsl(${hue},16%,88%)`,
+              textAlign:"center", fontWeight:700, lineHeight:1.35,
+              padding:"0 6px",
+              display:"-webkit-box", WebkitLineClamp:4,
+              WebkitBoxOrient:"vertical", overflow:"hidden" }}>
+              {book.name}
+            </div>
+          </>
+        )}
+
+        {/* Last page badge */}
+        {lastPage && (
+          <div style={{ position:"absolute", bottom:6, left:"50%",
+            transform:"translateX(-50%)",
+            background:"rgba(0,0,0,0.65)", borderRadius:8,
+            padding:"2px 8px", fontSize:9,
+            color:`hsl(${hue},40%,75%)`, whiteSpace:"nowrap" }}>
+            Pg {lastPage}
+          </div>
+        )}
+
+        {/* Bookmark count badge */}
+        {bms>0 && (
+          <div style={{ position:"absolute", top:5, right:5,
+            background:"rgba(0,0,0,0.75)", borderRadius:6,
+            padding:"1px 5px", fontSize:8, color:C.neonL }}>
+            🔖{bms}
+          </div>
+        )}
+      </div>
+
+      {/* Book name below card — max 2 lines */}
+      <div dir="auto" style={{ fontSize:gridMode?9:10, fontWeight:700,
+        color:d?C.txM:"#334155",
+        lineHeight:1.35, marginBottom:2,
+        display:"-webkit-box", WebkitLineClamp:2,
+        WebkitBoxOrient:"vertical", overflow:"hidden" }}>
+        {book.name}
+      </div>
+
+      {/* Remove / action button */}
+      <button onClick={e=>{ e.stopPropagation(); onAction(); }}
+        style={{ position:"absolute", top:4, left:4,
+          background:"rgba(0,0,0,0.7)", border:"none", borderRadius:"50%",
+          width:20, height:20, cursor:"pointer", color:"#fff", fontSize:11,
+          display:"flex", alignItems:"center", justifyContent:"center", zIndex:2 }}>
+        {actionLabel}
+      </button>
+    </div>
+  );
+}
+
 function GlowBtn({ label, onClick, full, outline }) {
   return (
     <button onClick={onClick}
@@ -1517,7 +1677,7 @@ function DrawerSection({ label }) {
       padding:"6px 14px 4px" }}>{label}</div>
   );
 }
-function DrawerRow({ icon, label, sub, onClick, tx, txM, accL }) {
+function DrawerRow({ icon, label, sub, onClick, tx, txM }) {
   return (
     <div onClick={onClick}
       style={{ display:"flex", alignItems:"center", gap:14,
@@ -1531,86 +1691,6 @@ function DrawerRow({ icon, label, sub, onClick, tx, txM, accL }) {
         <div style={{ fontSize:11, color:txM, marginTop:1 }}>{sub}</div>
       </div>
       <div style={{ color:C.txM, fontSize:14 }}>›</div>
-    </div>
-  );
-}
-function SmallBookCard({ book, hue, lastPage, bms, onOpen, onRemove, d }) {
-  return (
-    <div style={{ flexShrink:0, width:105, position:"relative", cursor:"pointer" }}
-      onClick={onOpen}>
-      <div style={{ height:145, borderRadius:14,
-        background:`linear-gradient(160deg,hsl(${hue},60%,28%),hsl(${hue+30},50%,16%))`,
-        border:`1px solid hsl(${hue},40%,35%)`,
-        boxShadow:`0 0 18px hsla(${hue},60%,40%,.22),0 6px 28px rgba(0,0,0,.5)`,
-        display:"flex", flexDirection:"column", alignItems:"center",
-        justifyContent:"center", padding:"10px 6px", gap:6, marginBottom:8,
-        transition:"transform .2s, box-shadow .2s" }}
-        onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-4px)";e.currentTarget.style.boxShadow=`0 0 28px hsla(${hue},60%,40%,.4),0 14px 36px rgba(0,0,0,.6)`;}}
-        onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=`0 0 18px hsla(${hue},60%,40%,.22),0 6px 28px rgba(0,0,0,.5)`;}} >
-        <div style={{ fontSize:24 }}>📄</div>
-        <div dir="auto" style={{ fontSize:9, color:`hsl(${hue},18%,88%)`,
-          textAlign:"center", fontWeight:700, lineHeight:1.4,
-          display:"-webkit-box", WebkitLineClamp:4,
-          WebkitBoxOrient:"vertical", overflow:"hidden" }}>{book.name}</div>
-        {lastPage && (
-          <div style={{ fontSize:9, color:`hsl(${hue},40%,72%)`,
-            background:"rgba(0,0,0,0.3)", borderRadius:8, padding:"2px 6px" }}>
-            Pg {lastPage}
-          </div>
-        )}
-        {bms>0 && (
-          <div style={{ position:"absolute", top:5, right:5,
-            background:"rgba(0,0,0,0.7)", borderRadius:6,
-            padding:"1px 5px", fontSize:8, color:C.neonL }}>
-            🔖{bms}
-          </div>
-        )}
-      </div>
-      <div dir="auto" style={{ fontSize:10, fontWeight:700, color:d?C.txM:"#334155",
-        lineHeight:1.3, display:"-webkit-box", WebkitLineClamp:2,
-        WebkitBoxOrient:"vertical", overflow:"hidden" }}>{book.name}</div>
-      <button onClick={e=>{e.stopPropagation();onRemove();}}
-        style={{ position:"absolute", top:5, left:5, background:"rgba(0,0,0,0.65)",
-          border:"none", borderRadius:"50%", width:20, height:20, cursor:"pointer",
-          color:"#fff", fontSize:11, display:"flex", alignItems:"center",
-          justifyContent:"center" }}>×</button>
-    </div>
-  );
-}
-function BigBookCard({ book, hue, lastPage, bms, onOpen, onDelete }) {
-  return (
-    <div style={{ position:"relative", animation:"fadeIn .3s ease both" }}>
-      <div onClick={onOpen} style={{ cursor:"pointer" }}>
-        <div style={{ aspectRatio:"2/3", borderRadius:14,
-          background:`linear-gradient(160deg,hsl(${hue},55%,26%),hsl(${hue+30},45%,15%))`,
-          border:`1px solid hsl(${hue},35%,30%)`,
-          boxShadow:`0 0 14px hsla(${hue},50%,32%,.18),0 5px 20px rgba(0,0,0,.5)`,
-          display:"flex", flexDirection:"column", alignItems:"center",
-          justifyContent:"center", padding:"10px 6px", gap:6, marginBottom:6,
-          transition:"transform .2s, box-shadow .2s" }}
-          onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-3px)";e.currentTarget.style.boxShadow=`0 0 22px hsla(${hue},50%,32%,.32),0 10px 28px rgba(0,0,0,.6)`;}}
-          onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=`0 0 14px hsla(${hue},50%,32%,.18),0 5px 20px rgba(0,0,0,.5)`;}} >
-          <div style={{ fontSize:20 }}>📄</div>
-          <div dir="auto" style={{ fontSize:8, color:`hsl(${hue},15%,88%)`,
-            textAlign:"center", fontWeight:700, lineHeight:1.3,
-            display:"-webkit-box", WebkitLineClamp:4,
-            WebkitBoxOrient:"vertical", overflow:"hidden" }}>{book.name}</div>
-          {bms>0 && (
-            <div style={{ position:"absolute", top:4, right:4,
-              background:"rgba(0,0,0,0.7)", borderRadius:6,
-              padding:"1px 4px", fontSize:8, color:C.neonL }}>🔖{bms}</div>
-          )}
-        </div>
-        <div dir="auto" style={{ fontSize:9, fontWeight:700, color:C.txM,
-          lineHeight:1.3, display:"-webkit-box", WebkitLineClamp:2,
-          WebkitBoxOrient:"vertical", overflow:"hidden" }}>{book.name}</div>
-        {lastPage&&<div style={{ fontSize:8, color:C.neon, marginTop:1 }}>Pg {lastPage}</div>}
-      </div>
-      <button onClick={onDelete}
-        style={{ position:"absolute", top:4, left:4, background:"rgba(0,0,0,0.7)",
-          border:"none", borderRadius:"50%", width:18, height:18, cursor:"pointer",
-          color:"#fff", fontSize:10, display:"flex", alignItems:"center",
-          justifyContent:"center" }}>×</button>
     </div>
   );
 }
