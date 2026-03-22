@@ -389,7 +389,13 @@ export default function App() {
       if (!activePanelRef.current) setShowControls(false);
     }, 4000);
   };
-
+useEffect(() => {
+  if (screen === "reader" && pdfDoc) {
+    setTimeout(() => {
+      renderPage(pdfDoc, currentPage);
+    }, 100);
+  }
+}, [screen, pdfDoc]);
   // ── FIX ii: Generate and cache thumbnail for a book ──────────────────────────
   const ensureThumb = useCallback(async (name, buf) => {
     if (thumbs[name]) return; // already have it
