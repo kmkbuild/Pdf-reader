@@ -22,11 +22,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Install Capacitor packages
+        run: npm install @capacitor/core@6 @capacitor/android@6 @capacitor/app@6 @capacitor/cli@6
+
       - name: Build web app
         run: npm run build
-
-      - name: Install Capacitor
-        run: npm install @capacitor/core@6 @capacitor/android@6 @capacitor/app@6 @capacitor/cli@6
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -40,19 +40,33 @@ jobs:
       - name: Accept Android licenses
         run: yes | sdkmanager --licenses || true
 
-      - name: Add Android platform only if not exists
-        run: |
-          if [ ! -d "android" ]; then
-            npx cap add android
-          fi
+      - name: Remove old android folder if exists
+        run: rm -rf android
+
+      - name: Add Android platform fresh
+        run: npx cap add android
 
       - name: Sync Capacitor
         run: npx cap sync android
 
+      - name: Verify android folder exists
+        run: |
+          if [ ! -d "android" ]; then
+            echo "ERROR: android folder not created!"
+            exit 1
+          fi
+          if [ ! -f "android/gradlew" ]; then
+            echo "ERROR: gradlew not found!"
+            ls -la android/
+            exit 1
+          fi
+          echo "android folder OK"
+          ls -la android/
+
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
-      - name: Build APK
+      - name: Build debug APK
         run: |
           cd android
           ./gradlew assembleDebug --no-daemon
