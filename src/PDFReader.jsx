@@ -249,6 +249,8 @@ export default function App() {
   const [toast, setToast] = useState(null);
   const [showPerm, setShowPerm] = useState(false);
   const [permState, setPermState] = useState("unknown");
+  const [fileKey, setFileKey] = useState(0); // FIX 2: increment to remount input
+  const [scanKey, setScanKey] = useState(0);
   const [plusPressed, setPlusPressed] = useState(false);
 
   // Drawer
@@ -400,18 +402,30 @@ export default function App() {
     } catch {}
   }, [thumbs]);
 
-  // ── STORAGE PERMISSION ───────────────────────────────────────────────────────
+  // FIX 3: Storage permission & scan
+  // On Capacitor Android WebView, showDirectoryPicker is NOT available.
+  // webkitdirectory input works but requires user to navigate to the folder.
+  // Best UX: show a clear guide, then open the folder picker input.
   const grantPermission = async () => {
-    setShowPerm(false); setPermState("granted");
+    setShowPerm(false);
+    setPermState("granted");
     await dbSet("permState","granted").catch(()=>{});
+
+    // Try modern File System Access API (Chrome desktop only)
     if ("showDirectoryPicker" in window) {
       try {
         const dir = await window.showDirectoryPicker({ mode:"read" });
-        await runFolderScan(dir); return;
-      } catch (e) { if (e?.name==="AbortError") return; }
+        await runFolderScan(dir);
+        return;
+      } catch (e) {
+        if (e?.name === "AbortError") return;
+        // Not available in this environment — fall through to input
+      }
     }
-    folderInputRef.current?.click();
+    // Fallback: folder input (works in Android WebView via webkitdirectory)
+    triggerFolderPicker();
   };
+
   const skipPerm = () => {
     setShowPerm(false); setPermState("skipped");
     dbSet("permState","skipped").catch(()=>{});
@@ -461,12 +475,16 @@ export default function App() {
     else toast_(`${count} PDF${count>1?"s":""} added!`, "success");
   };
 
-  // FIX vi: Reset input BEFORE triggering click (not after), so same file can be re-imported
+  // FIX 2: Remount the input element by changing its key — guarantees
+  // onChange always fires even when same file is selected again
   const triggerFilePicker = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ""; // clear FIRST
-      fileInputRef.current.click();    // THEN open picker
-    }
+    setFileKey(k => k + 1); // triggers remount
+    // Use setTimeout so React re-renders the new input before we click it
+    setTimeout(() => fileInputRef.current?.click(), 50);
+  };
+  const triggerFolderPicker = () => {
+    setScanKey(k => k + 1);
+    setTimeout(() => folderInputRef.current?.click(), 50);
   };
 
   const handleFiles = async (files) => {
@@ -489,9 +507,10 @@ export default function App() {
     toast_(`${books.length} PDF${books.length>1?"s":""} added!`, "success");
   };
 
-  // ── OPEN BOOK ─────────────────────────────────────────────────────────────────
-  // FIX iv: Urdu/Arabic PDFs — added useSystemFonts, disableFontFace:false,
-  // isEvalSupported:false, verbosity:0 for maximum compatibility
+  // FIX 4: openBook — try multiple loading strategies for maximum compatibility
+  // Strategy 1: full options (Urdu/Arabic/Unicode fonts)
+  // Strategy 2: simplified options (some PDFs reject certain options)
+  // Strategy 3: minimal options (last resort for unusual PDFs)
   const openBook = async (book) => {
     if (!pdfjsReady) { toast_("PDF engine loading…"); return; }
     stopVoice();
@@ -500,31 +519,61 @@ export default function App() {
     setActivePanel(null); setDrawerOpen(false);
     setRecentBooks(prev=>[book.name,...prev.filter(n=>n!==book.name)].slice(0,6));
     const resumePage = lastRead[book.name] || 1;
-    try {
-      const buf = await book.file.arrayBuffer();
-      const loadingTask = window.pdfjsLib.getDocument({
+
+    let doc = null;
+    let buf;
+    try { buf = await book.file.arrayBuffer(); } catch {
+      toast_("Could not read this file. Try re-importing it.", "error"); return;
+    }
+
+    // Strategy 1: Full options — best for Urdu/Arabic/Unicode
+    const strategies = [
+      {
         data: buf,
         cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/cmaps/`,
         cMapPacked: true,
         standardFontDataUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/standard_fonts/`,
-        // FIX iv: these options fix Urdu/Arabic/non-Latin PDFs
         useSystemFonts: true,
         disableFontFace: false,
         isEvalSupported: false,
         verbosity: 0,
-      });
-      const doc = await loadingTask.promise;
-      setCurrentPage(resumePage);
-      setNumPages(doc.numPages);
-      // FIX iii: set pdfDoc LAST so render fires with correct page already set
-      setPdfDoc(doc);
-      try { setToc(flattenOutline(await doc.getOutline())); } catch { setToc([]); }
-      setScreen("reader");
-      setShowControls(true);
-    } catch (err) {
-      console.error("PDF open error:", err);
-      toast_("Could not open this PDF. File may be unsupported.", "error");
+      },
+      // Strategy 2: Without system fonts (some PDFs conflict with it)
+      {
+        data: buf,
+        cMapUrl: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PV}/cmaps/`,
+        cMapPacked: true,
+        useSystemFonts: false,
+        verbosity: 0,
+      },
+      // Strategy 3: Bare minimum (maximum compatibility)
+      {
+        data: buf,
+        verbosity: 0,
+      },
+    ];
+
+    for (const opts of strategies) {
+      try {
+        doc = await window.pdfjsLib.getDocument(opts).promise;
+        break; // success
+      } catch (err) {
+        console.warn("PDF strategy failed:", err?.message);
+        doc = null;
+      }
     }
+
+    if (!doc) {
+      toast_("Could not open this PDF. It may be corrupted or password-protected.", "error");
+      return;
+    }
+
+    setCurrentPage(resumePage);
+    setNumPages(doc.numPages);
+    setPdfDoc(doc);
+    try { setToc(flattenOutline(await doc.getOutline())); } catch { setToc([]); }
+    setScreen("reader");
+    setShowControls(true);
   };
 
   const flattenOutline = (items, d=0) => {
@@ -593,19 +642,45 @@ export default function App() {
     zt.current = setTimeout(() => renderPage(pdfDoc, currentPage, zoom), 150);
   }, [zoom]);
 
-  // ── PINCH ZOOM ───────────────────────────────────────────────────────────────
+  // ── FIX 1: SMOOTH PINCH ZOOM ─────────────────────────────────────────────────
+  // Old problem: every touch move fired setZoom → triggered re-render → lag
+  // Fix: accumulate zoom in a ref during gesture, only setZoom on touchend
+  const liveZoomRef = useRef(zoom); // tracks zoom during gesture without re-renders
   const onTS = e => {
-    if (e.touches.length!==2) return;
-    const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
-    pinchRef.current={active:true,startDist:Math.hypot(dx,dy),startZoom:zoom};
+    if (e.touches.length !== 2) return;
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    pinchRef.current = { active:true, startDist:Math.hypot(dx,dy), startZoom:zoom };
+    liveZoomRef.current = zoom;
   };
   const onTM = e => {
-    if (!pinchRef.current.active||e.touches.length!==2) return;
+    if (!pinchRef.current.active || e.touches.length !== 2) return;
     e.preventDefault();
-    const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
-    setZoom(parseFloat(Math.max(0.5,Math.min(4,pinchRef.current.startZoom*(Math.hypot(dx,dy)/pinchRef.current.startDist))).toFixed(2)));
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const raw = pinchRef.current.startZoom * (Math.hypot(dx,dy) / pinchRef.current.startDist);
+    // Apply slight dampening (0.92) so fast gestures feel controlled not jumpy
+    const dampened = pinchRef.current.startZoom + (raw - pinchRef.current.startZoom) * 0.92;
+    liveZoomRef.current = Math.max(0.4, Math.min(4, dampened));
+    // Apply CSS transform instantly (no re-render) for visual smoothness
+    if (canvasRef.current) {
+      const scaleFactor = liveZoomRef.current / pinchRef.current.startZoom;
+      canvasRef.current.parentElement.style.transform = `scale(${scaleFactor})`;
+      canvasRef.current.parentElement.style.transformOrigin = "top center";
+    }
   };
-  const onTE = () => { pinchRef.current.active=false; };
+  const onTE = () => {
+    if (!pinchRef.current.active) return;
+    pinchRef.current.active = false;
+    // Remove temporary CSS transform
+    if (canvasRef.current) {
+      canvasRef.current.parentElement.style.transform = "";
+    }
+    // Now trigger actual re-render with final zoom value
+    const finalZoom = parseFloat(liveZoomRef.current.toFixed(2));
+    setZoom(finalZoom);
+  };
 
   // ── PAGE NAV ─────────────────────────────────────────────────────────────────
   const goToPage = n => {
@@ -691,21 +766,99 @@ export default function App() {
     setResultIdx(i); goToPage(searchRes[i].page);
   };
 
-  // ── VOICE ────────────────────────────────────────────────────────────────────
+  // ── FIX 2: VOICE — language auto-detect + male/female + works on Android ────
+  const [voices, setVoices] = useState([]);
+  const [voiceGender, setVoiceGender] = useState("female");
+  const [detectedLang, setDetectedLang] = useState("en");
+  const voicesLoadedRef = useRef(false);
+
+  // Load voices — they load async on Android, need multiple attempts
+  useEffect(() => {
+    const load = () => {
+      const v = window.speechSynthesis?.getVoices() || [];
+      if (v.length > 0) { setVoices(v); voicesLoadedRef.current = true; }
+    };
+    load();
+    window.speechSynthesis?.addEventListener("voiceschanged", load);
+    setTimeout(load, 500);
+    setTimeout(load, 1500);
+    setTimeout(load, 3000);
+    return () => window.speechSynthesis?.removeEventListener("voiceschanged", load);
+  }, []);
+
+  const detectLanguage = (text) => {
+    if (!text || text.trim().length < 10) return "en";
+    const s = text.slice(0, 500);
+    const counts = {
+      urdu:   (s.match(/[\u0600-\u06FF]/g)||[]).length,
+      hindi:  (s.match(/[\u0900-\u097F]/g)||[]).length,
+      chinese:(s.match(/[\u4E00-\u9FFF]/g)||[]).length,
+      french: (s.match(/[àâçéèêëîïôùûüÿæœ]/gi)||[]).length,
+    };
+    const t = s.length;
+    if (counts.urdu   / t > 0.12) return "ur";
+    if (counts.hindi  / t > 0.12) return "hi";
+    if (counts.chinese/ t > 0.12) return "zh";
+    if (counts.french / t > 0.04) return "fr";
+    return "en";
+  };
+
+  const findVoice = (lang, gender, allVoices) => {
+    if (!allVoices.length) return null;
+    const langCodes = { en:["en-US","en-GB","en-IN","en"], ur:["ur-PK","ur","ar-SA","ar"],
+      ar:["ar-SA","ar-EG","ar"], hi:["hi-IN","hi"], zh:["zh-CN","zh-TW","zh"], fr:["fr-FR","fr-CA","fr"] };
+    const maleKW   = ["male","man","david","mark","daniel","jorge","carlos","pierre","wei","raj","ali","google uk english male"];
+    const femaleKW = ["female","woman","samantha","victoria","karen","alice","anna","moira","tessa","zira","nora","sara","aria","zoya","google uk english female"];
+    const codes  = langCodes[lang] || [lang,"en"];
+    const genderKW = gender==="male" ? maleKW : femaleKW;
+    // Try lang + gender match first
+    for (const code of codes) {
+      const v = allVoices.find(v => v.lang.toLowerCase().startsWith(code.toLowerCase().split("-")[0])
+        && genderKW.some(kw => v.name.toLowerCase().includes(kw)));
+      if (v) return v;
+    }
+    // Then any voice for this language
+    for (const code of codes) {
+      const v = allVoices.find(v => v.lang.toLowerCase().startsWith(code.toLowerCase().split("-")[0]));
+      if (v) return v;
+    }
+    // English fallback with gender
+    const eng = allVoices.find(v => v.lang.startsWith("en") && genderKW.some(kw => v.name.toLowerCase().includes(kw)));
+    return eng || allVoices[0] || null;
+  };
+
   const startVoice = async () => {
     if (!pdfDoc) return;
+    // Reload voices if not yet loaded
+    if (!voicesLoadedRef.current || voices.length === 0) {
+      const v = window.speechSynthesis?.getVoices() || [];
+      if (v.length > 0) { setVoices(v); voicesLoadedRef.current = true; }
+    }
     try {
-      const text=await getPageText(pdfDoc,currentPage);
-      if (!text.trim()) { toast_("No readable text on this page."); return; }
+      const text = await getPageText(pdfDoc, currentPage);
+      if (!text?.trim()) { toast_("No readable text on this page."); return; }
       stopVoice();
-      const u=new SpeechSynthesisUtterance(text);
-      u.rate=voiceSpeed;
-      u.onstart=()=>setVoicePlaying(true);
-      u.onend=()=>{setVoicePlaying(false);setVoiceProgress(0);};
-      u.onboundary=e=>{if(e.name==="word")setVoiceProgress(e.charIndex/text.length);};
-      utterRef.current=u;
-      window.speechSynthesis.speak(u);
-    } catch { toast_("Text-to-speech not available."); }
+      const lang = detectLanguage(text);
+      setDetectedLang(lang);
+      const langLocale = { en:"en-US", ur:"ur-PK", ar:"ar-SA", hi:"hi-IN", zh:"zh-CN", fr:"fr-FR" };
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate  = voiceSpeed;
+      utter.pitch = 1;
+      utter.lang  = langLocale[lang] || "en-US";
+      const allV  = window.speechSynthesis?.getVoices() || voices;
+      const best  = findVoice(lang, voiceGender, allV);
+      if (best) utter.voice = best;
+      utter.onstart    = () => setVoicePlaying(true);
+      utter.onend      = () => { setVoicePlaying(false); setVoiceProgress(0); };
+      utter.onerror    = e  => { setVoicePlaying(false); setVoiceProgress(0); if (e.error!=="interrupted") toast_("Voice error: " + e.error); };
+      utter.onboundary = e  => { if (e.name==="word") setVoiceProgress(e.charIndex/text.length); };
+      utterRef.current = utter;
+      // Small delay needed on Android WebView before speak() fires reliably
+      setTimeout(() => { if (utterRef.current===utter) window.speechSynthesis.speak(utter); }, 120);
+    } catch (err) {
+      console.error("Voice:", err);
+      toast_("Voice reading not available on this device.");
+    }
   };
   const stopVoice = () => {
     window.speechSynthesis?.cancel();
@@ -740,11 +893,13 @@ export default function App() {
           background:"radial-gradient(circle,rgba(124,58,237,0.08) 0%,transparent 70%)", borderRadius:"50%" }} />
       </div>
 
-      {/* FIX vi: value cleared BEFORE click via triggerFilePicker() */}
-      <input ref={fileInputRef} type="file" accept=".pdf,application/pdf"
+      {/* FIX 2: key prop forces complete remount — onChange always fires */}
+      <input key={`file-${fileKey}`} ref={fileInputRef}
+        type="file" accept=".pdf,application/pdf"
         multiple style={{ display:"none" }}
         onChange={e=>handleFiles(e.target.files)} />
-      <input ref={folderInputRef} type="file" accept=".pdf"
+      <input key={`folder-${scanKey}`} ref={folderInputRef}
+        type="file" accept=".pdf"
         multiple webkitdirectory="" mozdirectory=""
         style={{ display:"none" }} onChange={handleFolderInput} />
 
@@ -789,9 +944,10 @@ export default function App() {
               Allow PDF Reader to find all PDFs on your device automatically
             </div>
             {[
-              {n:"1",t:"Tap the button below"},
-              {n:"2",t:'Select "Internal Storage" folder'},
-              {n:"3",t:"App scans and adds all PDFs"},
+              {n:"1",t:"Tap \"Scan Storage\" below"},
+              {n:"2",t:"A file browser will open"},
+              {n:"3",t:"Navigate to Internal Storage (root)"},
+              {n:"4",t:"Tap any PDF or select all — app saves them all"},
             ].map((s,i)=>(
               <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:12, marginBottom:12 }}>
                 <div style={{ width:24, height:24, borderRadius:"50%", flexShrink:0,
@@ -1142,12 +1298,12 @@ export default function App() {
               </div>
               <div style={{ fontSize:10, color:txM }}>Page {currentPage} of {numPages}</div>
             </div>
-            <button onClick={()=>setZoom(z=>Math.max(0.5,+(z-0.2).toFixed(1)))}
+            <button onClick={()=>setZoom(z=>Math.max(0.4, parseFloat((z-0.03).toFixed(2))))}
               style={glassBtn()}>−</button>
             <span style={{ fontSize:10, color:txM, minWidth:36, textAlign:"center" }}>
               {Math.round(zoom*100)}%
             </span>
-            <button onClick={()=>setZoom(z=>Math.min(4,+(z+0.2).toFixed(1)))}
+            <button onClick={()=>setZoom(z=>Math.min(4, parseFloat((z+0.03).toFixed(2))))}
               style={glassBtn()}>+</button>
           </div>
 
@@ -1393,9 +1549,38 @@ export default function App() {
                 {activePanel==="voice" && (
                   <>
                     <PanelTitle title="🎧 Voice Reader" tx={tx} />
-                    <div style={{ fontSize:12,color:txM,marginBottom:16 }}>Page {currentPage}</div>
+
+                    {/* Language detected + gender toggle */}
+                    <div style={{ display:"flex", alignItems:"center",
+                      justifyContent:"space-between", marginBottom:16,
+                      background:"rgba(59,130,246,0.08)", borderRadius:12,
+                      padding:"10px 14px", border:`1px solid ${border_}` }}>
+                      <div style={{ fontSize:12, color:txM }}>
+                        🌐 Language detected:&nbsp;
+                        <span style={{ color:C.neonL, fontWeight:700 }}>
+                          {{en:"English",ur:"اردو",ar:"Arabic",hi:"हिन्दी",zh:"中文",fr:"Français"}[detectedLang]||"English"}
+                        </span>
+                      </div>
+                      {/* Male / Female toggle */}
+                      <div style={{ display:"flex", borderRadius:10, overflow:"hidden",
+                        border:`1px solid ${C.border}` }}>
+                        {["female","male"].map(g=>(
+                          <button key={g} onClick={()=>{ setVoiceGender(g); if(voicePlaying){stopVoice();setTimeout(startVoice,200);} }}
+                            style={{ padding:"5px 10px", border:"none", cursor:"pointer",
+                              fontSize:11, fontWeight:700, fontFamily:"inherit",
+                              background:voiceGender===g?`linear-gradient(135deg,${C.glow},${C.purple})`:"transparent",
+                              color:voiceGender===g?"#fff":txM }}>
+                            {g==="female"?"♀ F":"♂ M"}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div style={{ fontSize:12,color:txM,marginBottom:12 }}>
+                      Page {currentPage} — {voicePlaying?"Reading…":"Tap play to listen"}
+                    </div>
                     <div style={{ display:"flex",alignItems:"center",
-                      justifyContent:"center",gap:3,margin:"16px 0",height:56 }}>
+                      justifyContent:"center",gap:3,margin:"12px 0",height:52 }}>
                       {Array.from({length:22}).map((_,i)=>(
                         <div key={i} style={{ width:4,borderRadius:4,
                           background:voicePlaying
@@ -1406,13 +1591,13 @@ export default function App() {
                           transition:"height .2s" }} />
                       ))}
                     </div>
-                    <div style={{ height:4,background:d?C.bg3:"#e2e8f0",borderRadius:4,marginBottom:22 }}>
+                    <div style={{ height:4,background:d?C.bg3:"#e2e8f0",borderRadius:4,marginBottom:20 }}>
                       <div style={{ height:"100%",borderRadius:4,
                         background:`linear-gradient(90deg,${C.neon},${C.purple})`,
                         width:`${voiceProgress*100}%`,transition:"width .3s" }} />
                     </div>
                     <div style={{ display:"flex",justifyContent:"center",gap:20,
-                      marginBottom:22,alignItems:"center" }}>
+                      marginBottom:20,alignItems:"center" }}>
                       <button onClick={()=>goToPage(currentPage-1)} disabled={currentPage===1}
                         style={{ ...glassBtn({width:44,height:44}),opacity:currentPage===1?.3:1 }}>⏮</button>
                       <button onClick={toggleVoice}
@@ -1428,19 +1613,23 @@ export default function App() {
                         style={{ ...glassBtn({width:44,height:44}),opacity:currentPage===numPages?.3:1 }}>⏭</button>
                     </div>
                     <div style={{ textAlign:"center" }}>
-                      <div style={{ fontSize:12,color:txM,marginBottom:10 }}>
+                      <div style={{ fontSize:12,color:txM,marginBottom:8 }}>
                         Speed: <span style={{color:C.neonL,fontWeight:700}}>{voiceSpeed}x</span>
                       </div>
-                      <input type="range" min="0.5" max="2" step="0.25" value={voiceSpeed}
+                      <input type="range" min="0.5" max="2" step="0.1" value={voiceSpeed}
                         onChange={e=>{
                           setVoiceSpeed(parseFloat(e.target.value));
-                          if (voicePlaying){stopVoice();setTimeout(startVoice,100);}
+                          if (voicePlaying){stopVoice();setTimeout(startVoice,200);}
                         }}
                         style={{ width:"80%",accentColor:C.neon }} />
                       <div style={{ display:"flex",justifyContent:"space-between",
-                        width:"80%",margin:"5px auto 0",fontSize:10,color:txM }}>
+                        width:"80%",margin:"4px auto 0",fontSize:10,color:txM }}>
                         <span>0.5x</span><span>1x</span><span>1.5x</span><span>2x</span>
                       </div>
+                    </div>
+                    {/* Available voices count */}
+                    <div style={{ textAlign:"center", marginTop:12, fontSize:10, color:C.txD }}>
+                      {voices.length} voice{voices.length!==1?"s":""} available on this device
                     </div>
                   </>
                 )}
@@ -1556,44 +1745,47 @@ export default function App() {
   );
 }
 
-// ── Shared BookCard — FIX i: SINGLE component used for BOTH recently opened
-// and all books sections so proportions are always identical ──────────────────
-function BookCard({ book, hue, thumb, lastPage, bms, onOpen, onAction, actionLabel, gridMode, d, txM }) {
-  // In grid mode: fill column width. In row mode: fixed width
-  const cardStyle = gridMode
-    ? { width:"100%", position:"relative", animation:"fadeIn .3s ease both" }
-    : { flexShrink:0, width:108, position:"relative", cursor:"pointer" };
+// ── BookCard — FIXED HEIGHT for both grid and row so all cards are identical ──
+// Root cause of size difference: thumbnail images had varying aspect ratios
+// which caused cards to grow/shrink. Fix: always use a fixed pixel height (148px)
+// and use objectFit:"cover" to fill it — thumbnail never changes card size.
+const CARD_H = 148; // single constant controls height everywhere
 
+function BookCard({ book, hue, thumb, lastPage, bms, onOpen, onAction, actionLabel, gridMode, d, txM }) {
   return (
-    <div style={cardStyle} onClick={gridMode ? onOpen : onOpen}>
-      {/* Cover */}
+    <div style={{
+      width: gridMode ? "100%" : 108,
+      flexShrink: gridMode ? undefined : 0,
+      position:"relative",
+      animation: gridMode ? "fadeIn .3s ease both" : undefined,
+      cursor:"pointer",
+    }} onClick={onOpen}>
+
+      {/* Cover — ALWAYS exactly CARD_H pixels tall */}
       <div style={{
-        // FIX i: same height in both modes — use aspectRatio so grid cards match
-        aspectRatio: gridMode ? "2/3" : undefined,
-        height: gridMode ? undefined : 148,
-        borderRadius:14, overflow:"hidden",
+        height: CARD_H,        // ← fixed height, never changes
+        borderRadius:14,
+        overflow:"hidden",     // ← clips thumbnail to this box
         background:`linear-gradient(160deg,hsl(${hue},58%,26%),hsl(${hue+30},48%,15%))`,
         border:`1px solid hsl(${hue},38%,32%)`,
         boxShadow:`0 0 16px hsla(${hue},55%,35%,.20),0 6px 24px rgba(0,0,0,.5)`,
         display:"flex", flexDirection:"column", alignItems:"center",
         justifyContent:"center", position:"relative",
         marginBottom:6, transition:"transform .2s, box-shadow .2s",
-        cursor:"pointer",
       }}
         onMouseEnter={e=>{e.currentTarget.style.transform="translateY(-3px)";e.currentTarget.style.boxShadow=`0 0 24px hsla(${hue},55%,35%,.36),0 12px 30px rgba(0,0,0,.6)`;}}
         onMouseLeave={e=>{e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=`0 0 16px hsla(${hue},55%,35%,.20),0 6px 24px rgba(0,0,0,.5)`;}} >
 
-        {/* FIX ii: show thumbnail if available, else icon + name */}
         {thumb ? (
+          // objectFit:"cover" fills the fixed box — never stretches the card
           <img src={thumb} alt={book.name}
-            style={{ width:"100%", height:"100%", objectFit:"cover",
-              display:"block", borderRadius:14 }} />
+            style={{ position:"absolute", inset:0, width:"100%", height:"100%",
+              objectFit:"cover", display:"block" }} />
         ) : (
           <>
-            <div style={{ fontSize:gridMode?20:22, marginBottom:6 }}>📄</div>
-            <div dir="auto" style={{ fontSize:gridMode?8:9, color:`hsl(${hue},16%,88%)`,
-              textAlign:"center", fontWeight:700, lineHeight:1.35,
-              padding:"0 6px",
+            <div style={{ fontSize:20, marginBottom:6 }}>📄</div>
+            <div dir="auto" style={{ fontSize:9, color:`hsl(${hue},16%,88%)`,
+              textAlign:"center", fontWeight:700, lineHeight:1.35, padding:"0 8px",
               display:"-webkit-box", WebkitLineClamp:4,
               WebkitBoxOrient:"vertical", overflow:"hidden" }}>
               {book.name}
@@ -1601,42 +1793,40 @@ function BookCard({ book, hue, thumb, lastPage, bms, onOpen, onAction, actionLab
           </>
         )}
 
-        {/* Last page badge */}
+        {/* Overlay badges — always on top of thumbnail */}
         {lastPage && (
           <div style={{ position:"absolute", bottom:6, left:"50%",
             transform:"translateX(-50%)",
-            background:"rgba(0,0,0,0.65)", borderRadius:8,
+            background:"rgba(0,0,0,0.70)", borderRadius:8,
             padding:"2px 8px", fontSize:9,
-            color:`hsl(${hue},40%,75%)`, whiteSpace:"nowrap" }}>
+            color:`hsl(${hue},40%,80%)`, whiteSpace:"nowrap", zIndex:2 }}>
             Pg {lastPage}
           </div>
         )}
-
-        {/* Bookmark count badge */}
         {bms>0 && (
           <div style={{ position:"absolute", top:5, right:5,
-            background:"rgba(0,0,0,0.75)", borderRadius:6,
-            padding:"1px 5px", fontSize:8, color:C.neonL }}>
+            background:"rgba(0,0,0,0.80)", borderRadius:6,
+            padding:"1px 5px", fontSize:8, color:C.neonL, zIndex:2 }}>
             🔖{bms}
           </div>
         )}
       </div>
 
-      {/* Book name below card — max 2 lines */}
-      <div dir="auto" style={{ fontSize:gridMode?9:10, fontWeight:700,
+      {/* Name — 2 lines max, same font size everywhere */}
+      <div dir="auto" style={{ fontSize:10, fontWeight:700,
         color:d?C.txM:"#334155",
-        lineHeight:1.35, marginBottom:2,
+        lineHeight:1.4, marginBottom:2,
         display:"-webkit-box", WebkitLineClamp:2,
         WebkitBoxOrient:"vertical", overflow:"hidden" }}>
         {book.name}
       </div>
 
-      {/* Remove / action button */}
+      {/* Action button (× remove) */}
       <button onClick={e=>{ e.stopPropagation(); onAction(); }}
         style={{ position:"absolute", top:4, left:4,
-          background:"rgba(0,0,0,0.7)", border:"none", borderRadius:"50%",
-          width:20, height:20, cursor:"pointer", color:"#fff", fontSize:11,
-          display:"flex", alignItems:"center", justifyContent:"center", zIndex:2 }}>
+          background:"rgba(0,0,0,0.75)", border:"none", borderRadius:"50%",
+          width:22, height:22, cursor:"pointer", color:"#fff", fontSize:12,
+          display:"flex", alignItems:"center", justifyContent:"center", zIndex:3 }}>
         {actionLabel}
       </button>
     </div>
