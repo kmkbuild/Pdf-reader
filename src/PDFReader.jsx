@@ -370,6 +370,11 @@ export default function App() {
     if (!restoredRef.current) return;
     Object.entries(notes).forEach(([n,p]) => dbSaveNotes(n,p).catch(()=>{}));
   }, [notes]);
+  useEffect(() => {
+  if (pdfDoc) {
+    renderPage(pdfDoc, currentPage);
+  }
+}, [currentPage, zoom]);
   useEffect(() => { if (restoredRef.current) dbSet("lastRead",lastRead).catch(()=>{}); }, [lastRead]);
   useEffect(() => { if (restoredRef.current) dbSet("recentBooks",recentBooks).catch(()=>{}); }, [recentBooks]);
   useEffect(() => { if (restoredRef.current) dbSet("dark",dark).catch(()=>{}); }, [dark]);
