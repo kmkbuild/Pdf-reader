@@ -627,20 +627,38 @@ useEffect(() => {
       const canvas = canvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext("2d");
+      canvas.style.opacity = 0.7;
       canvas.width  = Math.floor(vp.width  * dpr);
       canvas.height = Math.floor(vp.height * dpr);
       canvas.style.width  = `${Math.floor(vp.width)}px`;
       canvas.style.height = `${Math.floor(vp.height)}px`;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, vp.width, vp.height);
-      const task = page.render({
-        canvasContext: ctx,
-        viewport: vp,
-        intent: "display",
-      });
-      renderTaskRef.current = task;
-      await task.promise;
+     // 🔥 Create temp canvas (background render)
+const tempCanvas = document.createElement("canvas");
+const tempCtx = tempCanvas.getContext("2d");
+
+tempCanvas.width = Math.floor(vp.width * dpr);
+tempCanvas.height = Math.floor(vp.height * dpr);
+tempCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+// Render in background
+const task = page.render({
+  canvasContext: tempCtx,
+  viewport: vp,
+  intent: "display",
+});
+renderTaskRef.current = task;
+
+await task.promise;
+canvas.style.opacity = 1;
+// 🔥 Swap to main canvas (instant display)
+canvas.width = tempCanvas.width;
+canvas.height = tempCanvas.height;
+canvas.style.width = `${Math.floor(vp.width)}px`;
+canvas.style.height = `${Math.floor(vp.height)}px`;
+
+ctx.setTransform(1, 0, 0, 1, 0, 0);
+ctx.drawImage(tempCanvas, 0, 0);
       if (scaleOvr === undefined) setZoom(fit);
     } catch (e) {
       if (e?.name !== "RenderingCancelledException") console.error("Render:", e);
