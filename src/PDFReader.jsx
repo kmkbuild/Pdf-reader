@@ -684,12 +684,15 @@ ctx.drawImage(tempCanvas, 0, 0);
   // Fix: accumulate zoom in a ref during gesture, only setZoom on touchend
   const liveZoomRef = useRef(zoom); // tracks zoom during gesture without re-renders
  const onTS = e => {
+   
   if (e.touches.length === 1) {
     swipeRef.current = {
       startX: e.touches[0].clientX,
       startY: e.touches[0].clientY,
       isSwiping: true
     };
+  } else {
+    swipeRef.current.isSwiping = false; // ❗ important
   }
 
   if (e.touches.length !== 2) return;
@@ -701,8 +704,10 @@ ctx.drawImage(tempCanvas, 0, 0);
   pinchRef.current = {
     active: true,
     startDist: Math.hypot(dx, dy),
-    startZoom: liveZoomRef.current
+    startZoom: zoom
   };
+
+    liveZoomRef.current = zoom;
 };
   const onTM = e => {
     if (!pinchRef.current.active || e.touches.length !== 2) return;
@@ -720,8 +725,8 @@ ctx.drawImage(tempCanvas, 0, 0);
       canvasRef.current.parentElement.style.transformOrigin = "top center";
     }
   };
-  const onTE = () => { 
-     if (swipeRef.current.isSwiping) {
+  const onTE = (e) => { 
+     if (!pinchRef.current.active && swipeRef.current.isSwiping) {
     const endX = e.changedTouches[0].clientX;
     const diffX = endX - swipeRef.current.startX;
     const threshold = 50; // pixels
@@ -736,6 +741,7 @@ ctx.drawImage(tempCanvas, 0, 0);
     swipeRef.current.isSwiping = false;
   }
     if (!pinchRef.current.active) return;
+    
     pinchRef.current.active = false;
     // Remove temporary CSS transform
     if (canvasRef.current) {
