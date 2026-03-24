@@ -677,9 +677,9 @@ ctx.drawImage(tempCanvas, 0, 0);
       // Fit to screen width — renderPage will call setZoom(fit) via scaleOvr=undefined
       renderPage(pdfDoc, currentPage, undefined);
     } else {
-      // PAGE CHANGED — keep current zoom, don't reset to fit
-      renderPage(pdfDoc, currentPage, zoomRef.current);
-    }
+  setZoom(1); // reset zoom
+  renderPage(pdfDoc, currentPage, undefined); // fit to screen
+}
   }, [pdfDoc, currentPage]);
 
   // ZOOM CHANGED by +/- buttons or pinch: re-render at new zoom, debounced
@@ -735,11 +735,16 @@ ctx.drawImage(tempCanvas, 0, 0);
     const dampened = pinchRef.current.startZoom + (raw - pinchRef.current.startZoom) * 0.92;
     liveZoomRef.current = Math.max(0.4, Math.min(4, dampened));
     // Instant CSS scale while dragging — no React re-render, no lag
-    if (canvasRef.current) {
-      const sf = liveZoomRef.current / pinchRef.current.startZoom;
-      canvasRef.current.parentElement.style.transform = `scale(${sf})`;
-      canvasRef.current.parentElement.style.transformOrigin = "top center";
-    }
+     if (canvasRef.current) {
+  const sf = liveZoomRef.current / pinchRef.current.startZoom;
+
+  const rect = canvasRef.current.getBoundingClientRect();
+  const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+  const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+
+  canvasRef.current.parentElement.style.transform = `scale(${sf})`;
+  canvasRef.current.parentElement.style.transformOrigin = `${midX}px ${midY}px`;
+}
   };
 
   const onTE = (e) => {
@@ -1410,12 +1415,12 @@ ctx.drawImage(tempCanvas, 0, 0);
               </div>
               <div style={{ fontSize:10, color:txM }}>Page {currentPage} of {numPages}</div>
             </div>
-            <button onClick={()=>setZoom(z=>Math.max(0.4, parseFloat((z-0.03).toFixed(2))))}
+            <button onClick={()=>setZoom(z=>Math.max(0.4, parseFloat((z-0.06).toFixed(2))))}
               style={glassBtn()}>−</button>
             <span style={{ fontSize:10, color:txM, minWidth:36, textAlign:"center" }}>
               {Math.round(zoom*100)}%
             </span>
-            <button onClick={()=>setZoom(z=>Math.min(4, parseFloat((z+0.03).toFixed(2))))}
+            <button onClick={()=>setZoom(z=>Math.min(4, parseFloat((z+0.06).toFixed(2))))}
               style={glassBtn()}>+</button>
           </div>
 
