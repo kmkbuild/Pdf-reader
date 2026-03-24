@@ -371,11 +371,10 @@ export default function App() {
     if (!restoredRef.current) return;
     Object.entries(notes).forEach(([n,p]) => dbSaveNotes(n,p).catch(()=>{}));
   }, [notes]);
-  useEffect(() => {
-  if (pdfDoc) {
-    renderPage(pdfDoc, currentPage);
-  }
-}, [currentPage, zoom]);
+  // zoomRef always mirrors zoom state so callbacks never get stale zoom values
+  const zoomRef = useRef(zoom);
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
   useEffect(() => { if (restoredRef.current) dbSet("lastRead",lastRead).catch(()=>{}); }, [lastRead]);
   useEffect(() => { if (restoredRef.current) dbSet("recentBooks",recentBooks).catch(()=>{}); }, [recentBooks]);
   useEffect(() => { if (restoredRef.current) dbSet("dark",dark).catch(()=>{}); }, [dark]);
@@ -395,13 +394,13 @@ export default function App() {
       if (!activePanelRef.current) setShowControls(false);
     }, 4000);
   };
-useEffect(() => {
-  if (screen === "reader" && pdfDoc) {
-    setTimeout(() => {
-      renderPage(pdfDoc, currentPage);
-    }, 100);
-  }
-}, [screen, pdfDoc]);
+
+  // When reader screen mounts or pdfDoc loads, paint the canvas once
+  useEffect(() => {
+    if (screen === "reader" && pdfDoc) {
+      setTimeout(() => renderPage(pdfDoc, currentPage, zoomRef.current), 100);
+    }
+  }, [screen, pdfDoc]);
   // ── FIX ii: Generate and cache thumbnail for a book ──────────────────────────
   const ensureThumb = useCallback(async (name, buf) => {
     if (thumbs[name]) return; // already have it
@@ -668,10 +667,22 @@ ctx.drawImage(tempCanvas, 0, 0);
     }
   }, []);
 
+  // NEW BOOK opened (pdfDoc changes): fit-to-screen and reset zoom
+  const pdfDocRef = useRef(null);
   useEffect(() => {
-    if (pdfDoc) renderPage(pdfDoc, currentPage, undefined);
+    if (!pdfDoc) return;
+    const isNewDoc = pdfDoc !== pdfDocRef.current;
+    pdfDocRef.current = pdfDoc;
+    if (isNewDoc) {
+      // Fit to screen width — renderPage will call setZoom(fit) via scaleOvr=undefined
+      renderPage(pdfDoc, currentPage, undefined);
+    } else {
+      // PAGE CHANGED — keep current zoom, don't reset to fit
+      renderPage(pdfDoc, currentPage, zoomRef.current);
+    }
   }, [pdfDoc, currentPage]);
 
+  // ZOOM CHANGED by +/- buttons or pinch: re-render at new zoom, debounced
   const zt = useRef(null);
   useEffect(() => {
     if (!pdfDoc) return;
@@ -679,77 +690,85 @@ ctx.drawImage(tempCanvas, 0, 0);
     zt.current = setTimeout(() => renderPage(pdfDoc, currentPage, zoom), 150);
   }, [zoom]);
 
-  // ── FIX 1: SMOOTH PINCH ZOOM ─────────────────────────────────────────────────
-  // Old problem: every touch move fired setZoom → triggered re-render → lag
-  // Fix: accumulate zoom in a ref during gesture, only setZoom on touchend
-  const liveZoomRef = useRef(zoom); // tracks zoom during gesture without re-renders
- const onTS = e => {
-   
-  if (e.touches.length === 1) {
-    swipeRef.current = {
-      startX: e.touches[0].clientX,
-      startY: e.touches[0].clientY,
-      isSwiping: true
+  // ── PINCH ZOOM + SWIPE PAGE TURN ────────────────────────────────────────────
+  // Rules:
+  //  • 2-finger pinch → zoom in/out (CSS transform while dragging, re-render on end)
+  //  • 1-finger horizontal swipe → flip page ONLY when zoom is at/near fit (≤1.05)
+  //    so panning a zoomed PDF never accidentally flips a page
+  //  • After a pinch ends, swipe is locked out for 300 ms to prevent the
+  //    "lift fingers from pinch → accidental page flip" glitch
+  const liveZoomRef = useRef(zoom);
+  const swipeLockRef = useRef(false); // true for 300ms after any pinch ends
+
+  const onTS = e => {
+    if (e.touches.length === 1) {
+      // Only arm swipe if we're not zoomed in and not just coming off a pinch
+      const atFit = zoomRef.current <= 1.05;
+      swipeRef.current = {
+        startX: e.touches[0].clientX,
+        startY: e.touches[0].clientY,
+        isSwiping: atFit && !swipeLockRef.current,
+      };
+    } else {
+      // Multi-touch kills any pending swipe
+      swipeRef.current.isSwiping = false;
+    }
+
+    if (e.touches.length !== 2) return;
+    e.preventDefault();
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    pinchRef.current = {
+      active: true,
+      startDist: Math.hypot(dx, dy),
+      startZoom: zoomRef.current,
     };
-  } else {
-    swipeRef.current.isSwiping = false; // ❗ important
-  }
-
-  if (e.touches.length !== 2) return;
-  e.preventDefault();
-
-  const dx = e.touches[0].clientX - e.touches[1].clientX;
-  const dy = e.touches[0].clientY - e.touches[1].clientY;
-
-  pinchRef.current = {
-    active: true,
-    startDist: Math.hypot(dx, dy),
-    startZoom: zoom
+    liveZoomRef.current = zoomRef.current;
   };
 
-    liveZoomRef.current = zoom;
-};
   const onTM = e => {
     if (!pinchRef.current.active || e.touches.length !== 2) return;
     e.preventDefault();
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
-    const raw = pinchRef.current.startZoom * (Math.hypot(dx,dy) / pinchRef.current.startDist);
-    // Apply slight dampening (0.92) so fast gestures feel controlled not jumpy
+    const raw = pinchRef.current.startZoom * (Math.hypot(dx, dy) / pinchRef.current.startDist);
     const dampened = pinchRef.current.startZoom + (raw - pinchRef.current.startZoom) * 0.92;
     liveZoomRef.current = Math.max(0.4, Math.min(4, dampened));
-    // Apply CSS transform instantly (no re-render) for visual smoothness
+    // Instant CSS scale while dragging — no React re-render, no lag
     if (canvasRef.current) {
-      const scaleFactor = liveZoomRef.current / pinchRef.current.startZoom;
-      canvasRef.current.parentElement.style.transform = `scale(${scaleFactor})`;
+      const sf = liveZoomRef.current / pinchRef.current.startZoom;
+      canvasRef.current.parentElement.style.transform = `scale(${sf})`;
       canvasRef.current.parentElement.style.transformOrigin = "top center";
     }
   };
-  const onTE = (e) => { 
-     if (!pinchRef.current.active && swipeRef.current.isSwiping) {
-    const endX = e.changedTouches[0].clientX;
-    const diffX = endX - swipeRef.current.startX;
-    const threshold = 50; // pixels
 
-    if (diffX < -threshold && currentPage < numPages) {
-      setCurrentPage(p => p + 1); // swipe left → next page
-    }
-    if (diffX > threshold && currentPage > 1) {
-      setCurrentPage(p => p - 1); // swipe right → previous page
+  const onTE = (e) => {
+    // ── Swipe to flip page (only when not zoomed in and no pinch was active) ──
+    if (!pinchRef.current.active && swipeRef.current.isSwiping) {
+      const endX = e.changedTouches[0].clientX;
+      const endY = e.changedTouches[0].clientY;
+      const diffX = endX - swipeRef.current.startX;
+      const diffY = Math.abs(endY - swipeRef.current.startY);
+      // Must be more horizontal than vertical (not a scroll gesture)
+      if (Math.abs(diffX) > 50 && Math.abs(diffX) > diffY * 1.5) {
+        if (diffX < 0 && currentPage < numPages) {
+          goToPage(currentPage + 1); // swipe left → next page
+        } else if (diffX > 0 && currentPage > 1) {
+          goToPage(currentPage - 1); // swipe right → previous page
+        }
+      }
+      swipeRef.current.isSwiping = false;
     }
 
-    swipeRef.current.isSwiping = false;
-  }
+    // ── Pinch zoom end: commit zoom, lock swipe for 300ms ──
     if (!pinchRef.current.active) return;
-    
     pinchRef.current.active = false;
-    // Remove temporary CSS transform
-    if (canvasRef.current) {
-      canvasRef.current.parentElement.style.transform = "";
-    }
-    // Now trigger actual re-render with final zoom value
+    if (canvasRef.current) canvasRef.current.parentElement.style.transform = "";
     const finalZoom = parseFloat(liveZoomRef.current.toFixed(2));
     setZoom(finalZoom);
+    // Lock swipe so lifting pinch fingers doesn't trigger a page flip
+    swipeLockRef.current = true;
+    setTimeout(() => { swipeLockRef.current = false; }, 300);
   };
 
   // ── PAGE NAV ─────────────────────────────────────────────────────────────────
@@ -1303,8 +1322,8 @@ ctx.drawImage(tempCanvas, 0, 0);
                       No books match "<span style={{color:C.neonL}}>{libSearch}</span>"
                     </div>
                   ) : (
-                    /* FIX i: 3 equal columns, same card height as recently opened */
-                    <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
+                    /* FIX i: 3 fixed-width 108px columns — identical to Recent section cards */
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(3,108px)", gap:12, justifyContent:"start" }}>
                       {filtLib.map((book,i)=>(
                         <BookCard key={i} book={book}
                           hue={coverHue(book.name)}
@@ -1871,8 +1890,8 @@ const CARD_H = 148; // single constant controls height everywhere
 function BookCard({ book, hue, thumb, lastPage, bms, onOpen, onAction, actionLabel, gridMode, d, txM }) {
   return (
     <div style={{
-      width: gridMode ? "100%" : 108,
-      flexShrink: gridMode ? undefined : 0,
+      width: 108,          // ← always 108px — same in grid AND recent row
+      flexShrink: 0,
       position:"relative",
       animation: gridMode ? "fadeIn .3s ease both" : undefined,
       cursor:"pointer",
